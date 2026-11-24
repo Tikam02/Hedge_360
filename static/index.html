@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Put screener</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <div class="brand"><span class="brand-name">Put screener</span><span class="muted">NSE F&amp;O · nearest expiry</span></div>
+    <nav class="nav">
+      <a href="#/" data-nav="setup">New scan</a>
+      <a href="#/scan" data-nav="scan" hidden>Scan running</a>
+      <a href="#/results" data-nav="results" hidden>Last results</a>
+    </nav>
+  </div>
+</header>
+
+<!-- 1 · Set up -->
+<main id="view-setup" class="wrap view setup" hidden>
+  <section class="setup-form">
+    <div class="intro">
+      <h1>Which puts pay enough, far enough down?</h1>
+      <p class="muted">Two numbers decide it. The scan checks every F&amp;O stock and keeps each put strike that clears both.</p>
+    </div>
+
+    <div class="field">
+      <div class="field-head">
+        <label for="below">Strike at least this far below the price</label>
+        <span class="big"><span id="below-val">10</span>%</span>
+      </div>
+      <input id="below" type="range" min="1" max="40" step="1" value="10">
+      <div class="scale"><span>1%</span><span>40%</span></div>
+    </div>
+
+    <div class="field">
+      <div class="field-head">
+        <label for="prem">Premium at least this % of margin</label>
+        <span class="big"><input id="prem-num" type="number" min="0.1" max="100" step="0.1" value="5" aria-label="Premium % of margin, exact value">%</span>
+      </div>
+      <input id="prem" type="range" min="0.5" max="20" step="0.5" value="5">
+      <div class="scale"><span>0.5%</span><span>20% (type up to 100)</span></div>
+    </div>
+
+    <div class="run">
+      <button id="run" class="btn-primary" type="button">Scan all F&amp;O stocks</button>
+      <p id="run-note" class="note muted">About 220 stocks, roughly 6–8 minutes.</p>
+      <p id="run-error" class="note error" hidden></p>
+      <details class="note muted">
+        <summary>Fixed in the script</summary>
+        <ul>
+          <li>Margin = 15% of strike × lot size (a flat estimate, not your broker's SPAN)</li>
+          <li>Nearest expiry only</li>
+          <li>Indices (NIFTY, BANKNIFTY and others) left out</li>
+          <li>1.2 s pause between stocks, up to 3 retries on errors</li>
+        </ul>
+      </details>
+    </div>
+  </section>
+
+  <section class="explain" aria-label="What your numbers mean">
+    <div>
+      <span class="label muted">In plain terms</span>
+      <p class="plain">The put must pay at least <span class="accent"><span id="need-pct">0.75</span>% of its strike</span>, on a strike <span id="below-val-2">10</span>% or more below the price.</p>
+    </div>
+    <div>
+      <span class="label muted">Example: a stock at ₹1,000</span>
+      <div class="ex-ruler" aria-hidden="true">
+        <div class="ex-line"></div>
+        <div class="ex-zone" id="ex-zone"></div>
+        <div class="ex-cut" id="ex-cut"></div>
+        <div class="ex-cut-label" id="ex-cut-label">₹900</div>
+        <div class="ex-now"></div>
+        <div class="ex-now-label">₹1,000 now</div>
+        <div class="ex-min-label">₹600</div>
+        <div class="ex-zone-label">strikes checked</div>
+      </div>
+    </div>
+    <div class="ex-grid">
+      <div><span class="muted small">Highest strike checked</span><strong id="ex-strike">₹900</strong></div>
+      <div><span class="muted small">Premium needed there</span><strong id="ex-need">₹6.75 / share</strong></div>
+    </div>
+    <div class="formula muted">
+      <code>premium × lot ÷ (15% × strike × lot) ≥ <span id="prem-val">5</span>%</code>
+      <span>Lot size cancels out, so the test is the same for every stock: premium ÷ strike ≥ <span id="prem-val-2">5</span>% × 0.15 = <span id="need-pct-2">0.75</span>%.</span>
+    </div>
+  </section>
+</main>
+
+<!-- 2 · Scanning -->
+<main id="view-scan" class="wrap view scan" hidden>
+  <section class="scan-head">
+    <div class="scan-top">
+      <div>
+        <span class="muted small" id="scan-stage">Scanning</span>
+        <div class="counter"><span id="scan-done">0</span> <span class="counter-total">/ <span id="scan-total">…</span></span></div>
+      </div>
+      <div class="scan-stats">
+        <div><span class="muted small">Elapsed</span><strong id="scan-elapsed">0:00</strong></div>
+        <div><span class="muted small">Left, about</span><strong id="scan-eta">…</strong></div>
+        <button id="stop" class="btn-secondary" type="button">Stop and show what's found</button>
+      </div>
+    </div>
+    <div id="cells" class="cells" role="progressbar" aria-label="Stocks scanned" aria-valuemin="0"></div>
+    <div class="legend muted small">
+      <span><i class="sw hit"></i>has a match</span>
+      <span><i class="sw none"></i>checked, no match</span>
+      <span><i class="sw skip"></i>skipped</span>
+      <span><i class="sw todo"></i>to do</span>
+    </div>
+    <p class="muted small">Settings: strike ≥ <span id="scan-below"></span>% below · premium ≥ <span id="scan-prem"></span>% of margin</p>
+  </section>
+
+  <div class="scan-body">
+    <section class="log-wrap" aria-label="Scan log">
+      <h2>Live log</h2>
+      <div id="log" class="log" aria-live="off"></div>
+    </section>
+    <aside class="scan-side">
+      <section>
+        <div class="side-head"><h2>Found so far</h2><span class="muted small" id="found-count">0 stocks</span></div>
+        <div id="found" class="found"></div>
+      </section>
+      <section>
+        <h2>Skipped · <span id="skip-count">0</span></h2>
+        <p id="skip-list" class="muted small">None yet.</p>
+      </section>
+      <section id="closed-note" class="callout" hidden>
+        <strong>Market closed</strong>
+        <span class="muted small">Premiums are the last traded prices, not live.</span>
+      </section>
+    </aside>
+  </div>
+</main>
+
+<!-- 3 · Results / 4 · No matches -->
+<main id="view-results" class="wrap view results" hidden>
+  <section class="res-head">
+    <div class="res-title">
+      <span id="res-flag" class="flag" hidden></span>
+      <h1 id="res-h1"></h1>
+      <span id="res-sub" class="muted"></span>
+    </div>
+    <div class="res-actions">
+      <label class="chk" id="traded-wrap"><input type="checkbox" id="only-traded" checked> Only strikes that traded</label>
+      <div class="seg" role="group" aria-label="View">
+        <button type="button" id="v-grouped" aria-pressed="true">By stock</button>
+        <button type="button" id="v-flat" aria-pressed="false">All columns</button>
+      </div>
+      <a id="csv" class="btn-primary" href="/api/scan/csv" download>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>
+        Download CSV
+      </a>
+    </div>
+  </section>
+
+  <div id="res-grouped">
+    <div id="ruler-legend" class="legend muted small"></div>
+    <div id="cards" class="cards"></div>
+  </div>
+
+  <div id="res-flat" hidden>
+    <span class="muted small">Same columns and order as the CSV, sorted by premium % of margin.</span>
+    <div class="table-box"><table id="flat-table" class="flat"></table></div>
+    <span class="muted small">Underlying is the option chain's underlying value (the spot price). pe.py labels it "Futures Price".</span>
+  </div>
+
+  <section id="stale" class="empty" hidden>
+    <h1>Every match had stale prices.</h1>
+    <p id="stale-why" class="muted"></p>
+    <button type="button" id="show-stale" class="btn-secondary" style="align-self: flex-start;">Show them anyway</button>
+    <a href="#/">Change both numbers</a>
+  </section>
+
+  <section id="empty" class="empty" hidden>
+    <h1>No strike cleared both numbers.</h1>
+    <p id="empty-why" class="muted"></p>
+    <div class="hints">
+      <button type="button" class="hint" id="hint-prem"><span><strong id="hint-prem-t"></strong><span class="muted small" id="hint-prem-s"></span></span><span class="go">Run again</span></button>
+      <button type="button" class="hint" id="hint-below"><span><strong id="hint-below-t"></strong><span class="muted small">Closer strikes carry bigger premiums</span></span><span class="go">Run again</span></button>
+      <div class="hint static"><span><strong>Run during market hours</strong><span class="muted small" id="hint-hours">9:15 to 15:30 IST.</span></span></div>
+    </div>
+    <a href="#/">Change both numbers yourself</a>
+  </section>
+
+  <footer class="res-foot muted small">
+    <span>Margin is a flat 15% of strike × lot. Your broker's SPAN margin will differ.</span>
+    <span>For research only. Check real margins with your broker before trading.</span>
+  </footer>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

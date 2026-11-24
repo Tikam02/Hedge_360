@@ -1,0 +1,5 @@
+nse[local]>=5.2
+pandas
+tabulate
+fastapi
+uvicorn[standard]
