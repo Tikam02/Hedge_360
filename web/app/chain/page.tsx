@@ -12,13 +12,16 @@ import type { OptionRow, OptType } from '@/lib/data';
 import { useStore } from '@/lib/store';
 import { daysTo, fmt, tone } from '@/lib/util';
 
-type ColKey = 'oi' | 'chgOi' | 'vol' | 'iv' | 'delta' | 'chg' | 'ltp';
+type ColKey = 'oi' | 'chgOi' | 'vol' | 'iv' | 'delta' | 'chg' | 'margin' | 'yield' | 'ltp';
 // Listed outside-in for calls; puts mirror the order so LTP always sits next to the strike.
 const COLS: Array<{ key: ColKey; label: string; locked?: boolean }> = [
   { key: 'oi', label: 'OI' }, { key: 'chgOi', label: 'Chg in OI' }, { key: 'vol', label: 'Volume' }, { key: 'iv', label: 'IV' },
-  { key: 'delta', label: 'Delta' }, { key: 'chg', label: 'Chg %' }, { key: 'ltp', label: 'LTP', locked: true },
+  { key: 'delta', label: 'Delta' }, { key: 'chg', label: 'Chg %' }, { key: 'margin', label: 'Margin' },
+  { key: 'yield', label: 'Prem % margin' }, { key: 'ltp', label: 'LTP', locked: true },
 ];
-const DEFAULT_COLS: ColKey[] = ['oi', 'chgOi', 'iv', 'chg'];
+// Only offered when the chain carries the broker's margins (live Kite data).
+const MARGIN_COLS: ColKey[] = ['margin', 'yield'];
+const DEFAULT_COLS: ColKey[] = ['oi', 'chgOi', 'iv', 'chg', 'yield'];
 const COLS_KEY = 'hedge360.chain.cols';
 // On phones, showing both sides keeps only OI and LTP so the table fits without scrolling sideways.
 const CORE: ColKey[] = ['oi', 'ltp'];
@@ -80,7 +83,7 @@ function Chain() {
         <h1>Option chain</h1>
         <p>{c ? <>{c.symbol} · {c.index ? 'Index' : c.sector} · Lot {fmt(c.lot, 0)} · {c.dte} days to {expShort(c.expiry)} expiry</> : symbol}</p>
       </div>
-      {c && <span className="src-tag">{c.source === 'sample' ? 'Sample data' : 'Live'}</span>}
+      {c && <span className="src-tag">{c.source === 'sample' ? 'Sample data' : 'Live · Kite'}</span>}
     </header>
   );
   if (chain.error && !c) return <main className="page pt">{head}<ApiNotice error={chain.error} retry={chain.retry} /></main>;
@@ -96,7 +99,9 @@ function Chain() {
   const spotAt = rows.findIndex((r) => r.strike > c.spot);
   const maxOi = Math.max(1, ...rows.flatMap((r) => [r.call.oi, r.put.oi]));
   const compact = phone && side === 'both';
-  const visible = COLS.filter((x) => (x.locked || cols.includes(x.key)) && (!compact || CORE.includes(x.key)));
+  const hasMargin = c.rows.some((r) => r.call.margin != null || r.put.margin != null);
+  const offered = COLS.filter((x) => hasMargin || !MARGIN_COLS.includes(x.key));
+  const visible = offered.filter((x) => (x.locked || cols.includes(x.key)) && (!compact || CORE.includes(x.key)));
   const callCols = side === 'puts' ? [] : visible;
   const putCols = side === 'calls' ? [] : [...visible].reverse();
   const span = callCols.length + putCols.length + 1;
@@ -107,6 +112,7 @@ function Chain() {
     const s = type === 'CE' ? r.call : r.put;
     const itm = type === 'CE' ? r.strike < c.spot : r.strike > c.spot;
     const cls = `num${itm ? ' itm' : ''}`;
+    const dash = <span className="muted">—</span>;
     switch (k) {
       case 'oi':
         return (
@@ -117,9 +123,11 @@ function Chain() {
         );
       case 'chgOi': return <td key={k} className={cls}>{s.chgOi > 0 ? '+' : ''}{fmt(s.chgOi, 0)}</td>;
       case 'vol': return <td key={k} className={cls}>{fmt(s.vol, 0)}</td>;
-      case 'iv': return <td key={k} className={cls}>{s.iv == null ? <span className="muted">—</span> : fmt(s.iv, 2)}</td>;
-      case 'delta': return <td key={k} className={cls}>{fmt(s.delta, 2)}</td>;
-      case 'chg': return <td key={k} className={cls}><span className={tone(s.chg)}>{pct(s.chg)}</span></td>;
+      case 'iv': return <td key={k} className={cls}>{s.iv == null ? dash : fmt(s.iv, 2)}</td>;
+      case 'delta': return <td key={k} className={cls}>{s.delta == null ? dash : fmt(s.delta, 2)}</td>;
+      case 'chg': return <td key={k} className={cls}>{s.chg == null ? dash : <span className={tone(s.chg)}>{pct(s.chg)}</span>}</td>;
+      case 'margin': return <td key={k} className={cls}>{s.margin == null ? dash : fmt(s.margin, 0)}</td>;
+      case 'yield': return <td key={k} className={cls}>{s.margin && s.ltp ? `${fmt((s.ltp * c.lot * 100) / s.margin, 2)}%` : dash}</td>;
       case 'ltp': {
         const o = chainOption(c, r, type);
         const done = !!executed[o.id];
@@ -165,7 +173,7 @@ function Chain() {
             <button key={v} type="button" aria-pressed={side === v} onClick={() => setSide(v)}>{v === 'both' ? 'Both' : v === 'calls' ? 'Calls' : 'Puts'}</button>
           ))}
         </div>
-        <ColumnsMenu columns={COLS} visible={cols} onChange={setCols} onReset={() => setCols(DEFAULT_COLS)} />
+        <ColumnsMenu columns={offered} visible={cols} onChange={setCols} onReset={() => setCols(DEFAULT_COLS)} />
       </section>
 
       <section className="ch-card" aria-labelledby="h-oi">
@@ -238,8 +246,14 @@ function Chain() {
         </div>
       </section>
       <p className="foot-note">
-        {c.source === 'sample' ? 'Sample chain from the analytics server (derivs.py), not market prices. ' : ''}
-        OI and volume are in contracts. The trade check estimates margin as strike × lot × {fmt(c.marginPct, 0)}%, the scanner’s rule.
+        {c.source === 'sample'
+          ? 'Sample chain from the analytics server (derivs.py), not market prices. '
+          : 'Live from Kite Connect, read only: quotes and margin calculations, never an order. IV and delta are worked out from each price. '}
+        OI and volume are in contracts.{' '}
+        {c.oiSince ? `Change in OI is from ${c.oiSince < '09:15' ? 'the previous close' : `${c.oiSince}, the first reading today`}. ` : ''}
+        {hasMargin
+          ? 'Margin is Kite’s margin to sell one lot (NRML) on its own; Prem % margin is premium × lot over that margin.'
+          : `The trade check estimates margin as strike × lot × ${fmt(c.marginPct, 0)}%, the scanner’s rule.`}
       </p>
 
       {open && <TradeCheck option={open} onClose={() => setOpen(null)} />}

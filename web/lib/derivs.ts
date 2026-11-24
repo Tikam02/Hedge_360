@@ -1,7 +1,7 @@
 'use client';
 // Client for the F&O analytics API (FastAPI: ../derivs.py, run with `.venv/bin/uvicorn server:app --port 8060`).
-// Sectors are sample data. The chain, symbol list and 3D grid switch to your own stock-derivatives API on the
-// server side (DERIVS_CHAIN_SOURCE in derivs.py), so nothing here changes. NEXT_PUBLIC_DERIVS_API only says where
+// Sample data unless the server runs with a live source: DERIVS_CHAIN_SOURCE in derivs.py switches the chain, symbol
+// list and 3D grid (and, for Kite, Sectors too) on the server side, so nothing here changes. NEXT_PUBLIC_DERIVS_API only says where
 // the analytics server runs. The GitHub Pages build has no server: there NEXT_PUBLIC_DERIVS_STATIC is set and each
 // request reads a JSON file written by export_static.py (see next.config.mjs).
 import { useCallback, useEffect, useState } from 'react';
@@ -39,20 +39,29 @@ export interface SectorStat {
   iv: { min: number; avg: number; max: number }; counts: Record<BuildUp, number>; stocks: StockStat[];
 }
 /** GET /sectors */
-export interface SectorsResp extends Meta { expiry: string; buildUps: BuildUp[]; indices: StockStat[]; sectors: SectorStat[] }
+export interface SectorsResp extends Meta {
+  expiry: string; buildUps: BuildUp[]; indices: StockStat[]; sectors: SectorStat[];
+  /** Live data: "HH:MM" IST of the futures OI reading the change is measured from (before 09:15 means the previous close). */
+  oiSince?: string | null;
+}
 
 export interface SymbolInfo { symbol: string; sector: string; index: boolean; spot: number; chg: number; lot: number; expiries: string[] }
 /** GET /symbols */
 export interface SymbolsResp extends Meta { marginPct: number; symbols: SymbolInfo[] }
 
-/** OI and volume are in contracts. `iv` is null when the strike didn't trade. */
-export interface Side { ltp: number; chg: number; iv: number | null; delta: number; oi: number; chgOi: number; vol: number }
+/**
+ * OI and volume are in contracts. `chg`, `iv` and `delta` are null when a live contract hasn't traded. `margin` is the
+ * broker's margin to sell one lot (live Kite data only); without it the app estimates margin from marginPct.
+ */
+export interface Side { ltp: number; chg: number | null; iv: number | null; delta: number | null; oi: number; chgOi: number; vol: number; margin: number | null }
 export interface ChainRow { strike: number; call: Side; put: Side }
 /** GET /chain?symbol=&expiry= */
 export interface ChainResp extends Meta {
   symbol: string; sector: string; index: boolean; expiry: string; expiries: string[]; spot: number; fut: number; chg: number;
   dte: number; lot: number; step: number; atmStrike: number; atmIv: number | null; maxPain: number;
   callOi: number; putOi: number; pcr: number | null; callChg: number; putChg: number; marginPct: number; rows: ChainRow[];
+  /** Live data: "HH:MM" IST of the OI reading change in OI is measured from (before 09:15 means the previous close). */
+  oiSince?: string | null;
 }
 /** GET /surface?symbol= : grids are [expiry][strike], null where an expiry has no such strike. */
 export interface SurfaceResp extends Meta {
@@ -101,20 +110,20 @@ export const expShort = (s: string) => s.replace(/-\d{2}(\d{2})$/, ' ’$1').rep
 
 /**
  * A chain contract in the screener's shape, so the trade check and Execute flow work unchanged. Contracts that are
- * also screener rows return the screener row itself, so "Executed" shows on both tabs. Margin follows the scanner:
- * strike × lot × margin %, marked as an estimate.
+ * also screener rows return the screener row itself, so "Executed" shows on both tabs. Margin is the broker's when
+ * the chain has it (Kite), else the scanner's rule, strike × lot × margin %, marked as an estimate.
  */
 export function chainOption(c: ChainResp, row: ChainRow, type: OptType): OptionRow {
   const known = OPTIONS.find((o) => o.symbol === c.symbol && o.expiry === c.expiry && o.strike === row.strike && o.type === type);
   if (known) return known;
   const s = type === 'CE' ? row.call : row.put;
   const K = row.strike, S = c.spot;
-  const margin = Math.round((K * c.lot * c.marginPct) / 100);
+  const margin = s.margin ?? Math.round((K * c.lot * c.marginPct) / 100);
   const totalPrem = Math.round(s.ltp * c.lot * 100) / 100;
   return {
     id: `chain-${c.symbol}-${c.expiry}-${K}-${type}`, symbol: c.symbol, type, cmp: S, strike: K,
     otm: Math.round(((type === 'PE' ? S - K : K - S) / S) * 10000) / 100, prem: s.ltp, lot: c.lot, totalPrem, margin,
     premPct: margin ? Math.round((totalPrem / margin) * 10000) / 100 : 0, expiry: c.expiry, fut: c.fut,
-    hi52: null, lo52: null, pe: null, iv: s.iv ?? 0, oi: s.oi, src: 'chain', est: ['margin'],
+    hi52: null, lo52: null, pe: null, iv: s.iv ?? 0, oi: s.oi, src: 'chain', est: s.margin ? [] : ['margin'],
   };
 }

@@ -5,13 +5,16 @@ Every number the charts show is worked out here: sector build-up, put-call ratio
 and the strike × expiry grid for the 3D view. Nothing is fetched from NSE.
 
 Two data sources, each a module with three functions: underlyings(), expiries(symbol) and chain(symbol, expiry)
-(shapes documented in derivs_sample.py):
-  - Sectors always come from the sample generator, derivs_sample.
+(shapes documented in derivs_sample.py). A chain source may also offer margins(), prefetch() and status(), as
+kite_chain.py does:
+  - Sectors come from the sample generator, derivs_sample, unless the chain source names a sector source of its own
+    (SECTOR_SOURCE): kite_chain names kite_sectors, so the Kite switch below moves both tabs to live data.
   - The option chain, the symbol picker and the 3D grid come from the module named by DERIVS_CHAIN_SOURCE,
     for example one that calls your own stock-derivatives API. Unset, they use the sample too. Your module only
     returns raw chain rows; totals, PCR, max pain, ATM IV and the grids are still worked out here.
 
     DERIVS_CHAIN_SOURCE=my_chain .venv/bin/uvicorn server:app --port 8060
+    DERIVS_CHAIN_SOURCE=kite_chain .venv/bin/uvicorn server:app --port 8060   # Kite Connect, read only
 
     GET /api/derivs/health                          where sectors and the chain come from (sample or live)
     GET /api/derivs/sectors                         sector and index derivatives summary
@@ -21,6 +24,7 @@ Two data sources, each a module with three functions: underlyings(), expiries(sy
 """
 
 import importlib
+import logging
 import os
 from datetime import datetime
 
@@ -31,11 +35,13 @@ from pe import MARGIN_PCT
 from scanner import IST
 
 router = APIRouter(prefix="/api/derivs", tags=["derivatives"])
+log = logging.getLogger("derivs")
 
-sector_source = derivs_sample
 chain_source = importlib.import_module(os.environ["DERIVS_CHAIN_SOURCE"]) if os.environ.get("DERIVS_CHAIN_SOURCE") else derivs_sample
+sector_source = importlib.import_module(getattr(chain_source, "SECTOR_SOURCE", "derivs_sample"))
 
 BUILD_UPS = ["Long build-up", "Short covering", "Short build-up", "Long unwinding"]
+SURFACE_EXPIRIES = 8  # the 3D view shows the nearest few; index weeklies would otherwise crowd it
 
 
 def build_up(chg, oi_chg):
@@ -56,9 +62,15 @@ def _underlying(symbol):
     return u
 
 
-def _side(s):
-    return {"ltp": s["ltp"], "chg": round(s["chg"], 2), "iv": round(s["iv"], 2) if s["iv"] else None,
-            "delta": round(s["delta"], 3), "oi": s["oi"], "chgOi": s["chg_oi"], "vol": s["vol"]}
+def _r(v, n):
+    return None if v is None else round(v, n)
+
+
+def _side(s, margin=None):
+    """chg, iv and delta are None when a live contract hasn't traded; margin is None unless the source gives one."""
+    return {"ltp": s["ltp"], "chg": _r(s["chg"], 2), "iv": _r(s["iv"], 2) if s["iv"] else None,
+            "delta": _r(s["delta"], 3), "oi": s["oi"], "chgOi": s["chg_oi"], "vol": s["vol"],
+            "margin": round(margin) if margin else None}
 
 
 def max_pain(rows):
@@ -101,7 +113,8 @@ def _stock(u):
 
 @router.get("/health")
 def health():
-    return {"ok": True, "sectors": _meta(sector_source)["source"], "chain": _meta(chain_source)["source"]}
+    state = lambda src: src.status() if hasattr(src, "status") else _meta(src)["source"]  # noqa: E731
+    return {"ok": True, "sectors": state(sector_source), "chain": state(chain_source)}
 
 
 @router.get("/sectors")
@@ -114,10 +127,14 @@ def sectors():
             continue
         # Price and OI change are weighted by option OI notional, so heavyweights count for more.
         w = [s["callCr"] + s["putCr"] for s in group]
+        if not sum(w):
+            w = [1] * len(group)
         wavg = lambda k: sum(s[k] * wi for s, wi in zip(group, w)) / sum(w)  # noqa: E731
         chg, oi_chg = wavg("chg"), wavg("oiChg")
         ivs = [s["atmIv"] for s in group if s["atmIv"] is not None]
         call_cr, put_cr = sum(s["callCr"] for s in group), sum(s["putCr"] for s in group)
+        if not (ivs and call_cr):
+            continue  # live data: no option in the sector has traded yet
         out.append({
             "name": name, "chg": round(chg, 2), "oiChg": round(oi_chg, 2), "buildUp": build_up(chg, oi_chg),
             "pcr": round(put_cr / call_cr, 3), "callCr": round(call_cr, 1), "putCr": round(put_cr, 1),
@@ -125,7 +142,9 @@ def sectors():
             "counts": {b: sum(1 for s in group if s["buildUp"] == b) for b in BUILD_UPS},
             "stocks": sorted(group, key=lambda s: -(s["callCr"] + s["putCr"])),
         })
-    return {**_meta(sector_source), "expiry": sector_source.expiries("NIFTY")[0], "buildUps": BUILD_UPS,
+    expiry = sector_source.near_expiry() if hasattr(sector_source, "near_expiry") else sector_source.expiries("NIFTY")[0]
+    return {**_meta(sector_source), "expiry": expiry, "buildUps": BUILD_UPS,
+            "oiSince": sector_source.oi_since() if hasattr(sector_source, "oi_since") else None,
             "indices": [s for s in stocks if s["sector"] == "Index"], "sectors": out}
 
 
@@ -145,9 +164,18 @@ def chain(symbol: str = Query(..., max_length=20), expiry: str | None = None):
     if expiry not in expiries:
         raise HTTPException(404, f"No {expiry} expiry for {u['symbol']}")
     c, s = chain_summary(chain_source, u, expiry)
+    m = {}
+    if hasattr(chain_source, "margins"):
+        # Best effort: without margins the app falls back to its estimate, so a margin error never fails the chain.
+        try:
+            m = chain_source.margins(u["symbol"], expiry, [x["strike"] for x in c["rows"]])
+        except Exception as e:  # noqa: BLE001
+            log.warning("margins for %s %s failed: %s", u["symbol"], expiry, e)
     return {**_meta(chain_source), **s, "symbol": u["symbol"], "sector": u["sector"], "index": u["index"], "expiry": expiry,
             "expiries": expiries, "chg": round(u["chg"], 2), "lot": u["lot"], "step": u["step"], "marginPct": MARGIN_PCT,
-            "rows": [{"strike": x["strike"], "call": _side(x["CE"]), "put": _side(x["PE"])} for x in c["rows"]]}
+            "oiSince": c.get("oi_since"),
+            "rows": [{"strike": x["strike"], "call": _side(x["CE"], m.get((x["strike"], "CE"))),
+                      "put": _side(x["PE"], m.get((x["strike"], "PE")))} for x in c["rows"]]}
 
 
 @router.get("/surface")
@@ -155,7 +183,10 @@ def surface(symbol: str = Query(..., max_length=20)):
     """OI per strike and expiry for both sides, and the IV smile per expiry (out-of-the-money side: puts below
     spot, calls above). Strikes are the union across expiries; a strike missing from an expiry is null."""
     u = _underlying(symbol)
-    chains = [(e, chain_source.chain(u["symbol"], e)) for e in chain_source.expiries(u["symbol"])]
+    expiries = chain_source.expiries(u["symbol"])[:SURFACE_EXPIRIES]
+    if hasattr(chain_source, "prefetch"):
+        chain_source.prefetch(u["symbol"], expiries)
+    chains = [(e, chain_source.chain(u["symbol"], e)) for e in expiries]
     strikes = sorted({x["strike"] for _, c in chains for x in c["rows"]})
     grid = lambda f: [[f(by[k]) if k in by else None for k in strikes]  # noqa: E731
                       for by in ({x["strike"]: x for x in c["rows"]} for _, c in chains)]
@@ -163,4 +194,4 @@ def surface(symbol: str = Query(..., max_length=20)):
     return {**_meta(chain_source), "symbol": u["symbol"], "spot": spot, "lot": u["lot"], "strikes": strikes,
             "expiries": [{"expiry": e, "dte": c["dte"]} for e, c in chains],
             "callOi": grid(lambda x: x["CE"]["oi"]), "putOi": grid(lambda x: x["PE"]["oi"]),
-            "iv": grid(lambda x: round((x["PE"] if x["strike"] < spot else x["CE"])["iv"], 2))}
+            "iv": grid(lambda x: _r((x["PE"] if x["strike"] < spot else x["CE"])["iv"], 2))}

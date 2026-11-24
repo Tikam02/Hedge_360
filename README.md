@@ -40,12 +40,37 @@ need it.
 ## Data
 
 - **Positions** are a made-up sample book and **screener rows** a fixed snapshot, both in `web/lib/data.ts`. Orders are simulated.
-- **Sectors** always come from the sample generator in `derivs_sample.py`.
-- **Option chain, symbol list and 3D grid** use the sample too, until you point them at your own stock-derivatives
-  API: write a module with `underlyings()`, `expiries(symbol)` and `chain(symbol, expiry)` (shapes documented in
-  `derivs_sample.py`) and start the server with `DERIVS_CHAIN_SOURCE=my_chain .venv/bin/uvicorn server:app --port 8060`.
-  Totals, PCR, max pain and the grids are still worked out in `derivs.py`.
+- **Sectors, option chain, symbol list and 3D grid** come from the sample generator in `derivs_sample.py` unless the
+  server runs with a live source (below). Totals, PCR, max pain and the grids are always worked out in `derivs.py`.
+- Your own stock-derivatives API: write a module with `underlyings()`, `expiries(symbol)` and `chain(symbol, expiry)`
+  (shapes documented in `derivs_sample.py`) and start the server with
+  `DERIVS_CHAIN_SOURCE=my_chain .venv/bin/uvicorn server:app --port 8060`.
 - The web app finds the API at `http://localhost:8060/api/derivs`; set `NEXT_PUBLIC_DERIVS_API` to change it.
+
+### Live F&O data from Kite Connect (read only)
+
+`kite_chain.py` and `kite_sectors.py` feed the Option chain and Sectoral analysis from Zerodha's Kite Connect: the
+instrument list, market quotes and the margin calculator. `kite_client.py` allows only those endpoints and refuses
+every other call before it is sent, so nothing here can place, modify or cancel an order. You need a Kite Connect app
+(developers.kite.trade) with market data access.
+
+```bash
+export KITE_API_KEY=...  KITE_API_SECRET=...   # from your Kite Connect app; never commit them
+.venv/bin/python kite_login.py                 # each morning: log in, paste the redirect URL
+DERIVS_CHAIN_SOURCE=kite_chain .venv/bin/uvicorn server:app --port 8060
+```
+
+The token is saved to `.kite_session.json` (owner-only, git-ignored) and lasts until 06:00 IST the next day.
+
+- **IV and delta** are worked out from each option's price the way NSE's option chain does it (Black-Scholes on
+  spot, 6.5%, days to expiry not counting today); checked against NSE's own chain to within 0.1 IV points.
+- **Change in OI**: Kite's quote has no previous-day OI, so it is measured from the first reading of the day, kept in
+  `.kite_cache/`. Start the API before 9:15 and that reading is the previous close.
+- **Margin** on the chain is Kite's margin to sell one lot on its own (NRML), from the basket margin calculator.
+- **Sectors** cover every F&O stock on its nearest expiry, grouped by the hand-kept `SECTOR_OF` map in
+  `kite_sectors.py` (stocks missing from it show under Other). It is refreshed at most once a minute. A pass needs
+  roughly 20 quote calls for some 200 stocks at Kite's limit of one a second (an estimate, not yet measured live),
+  so the first load takes about that many seconds, and the Option chain waits behind it meanwhile.
 
 ## GitHub Pages
 

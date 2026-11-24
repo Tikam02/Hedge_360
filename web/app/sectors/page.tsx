@@ -233,7 +233,10 @@ function Sectors() {
         </div>
       </section>
       <p className="foot-note">
-        {d.source === 'sample' ? 'Sample data from the analytics server (derivs.py), not market prices. ' : ''}
+        {d.source === 'sample' ? 'Sample data from the analytics server (derivs.py), not market prices. ' : <>
+          Live from Kite, read only, refreshed at most once a minute; each stock on its nearest expiry, PCR and option OI value over the 10 strikes
+          either side of spot. Futures OI change (all months) is {d.oiSince && d.oiSince >= '09:15' ? `from ${d.oiSince}, the first reading today` : 'from the previous close'}.{' '}
+        </>}
         Sector price and OI change are weighted by each stock’s option OI value (contracts × lot × spot). Build-up reads price and futures OI
         together: both up is long build-up, price down with OI up is short build-up, price up with OI down is short covering, both down is long unwinding.
       </p>

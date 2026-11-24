@@ -1,0 +1,160 @@
+"""
+Kite Connect as the Sectoral analysis source. derivs.py uses it whenever the chain source is kite_chain
+(kite_chain.SECTOR_SOURCE), so one switch moves both tabs to live data:
+
+    DERIVS_CHAIN_SOURCE=kite_chain .venv/bin/uvicorn server:app --port 8060
+
+Read only, like kite_chain: market quotes through kite_client, nothing else.
+
+Gives what derivs.py reads from a sector source (SECTORS, underlyings, expiries, chain, in derivs_sample's shapes)
+for every F&O underlying, each on its nearest expiry:
+  - One batched pass of full quotes, at most once a minute: the strikes nearest the spot (SECTOR_STRIKES each
+    side) and every futures month. Roughly 10,000 instruments, so about 20 quote calls at Kite's one a second
+    (an estimate): the first load of the tab takes that long, and the Option chain's quotes queue behind it. Later
+    loads within the minute are instant.
+  - Put-call ratio and option OI value cover those strikes only, which hold most of a stock's open interest.
+  - Futures OI change is all months together, measured from the first reading of the day (as change in OI is in
+    kite_chain), so a near-month rollover doesn't read as unwinding.
+  - IV change is the ATM IV now against the same options at yesterday's close, in percent.
+  - Kite gives no sector, so stocks are grouped by SECTOR_OF below; a stock missing from it shows under Other.
+"""
+
+import threading
+import time
+from collections import Counter
+
+import derivs_sample
+import kite_chain
+
+SECTOR_STRIKES = 10
+TTL = 60
+
+SECTOR_OF = {}
+for _sector, _names in {
+    "Banks": "HDFCBANK ICICIBANK SBIN AXISBANK KOTAKBANK INDUSINDBK BANKBARODA PNB CANBK FEDERALBNK IDFCFIRSTB AUBANK "
+             "BANDHANBNK UNIONBANK BANKINDIA INDIANB RBLBANK YESBANK",
+    "Financial services": "BAJFINANCE BAJAJFINSV HDFCLIFE SBILIFE ICICIPRULI ICICIGI SBICARD CHOLAFIN SHRIRAMFIN MUTHOOTFIN "
+                          "MANAPPURAM LICHSGFIN PFC RECLTD IRFC M&MFIN PEL PIRAMALFIN POONAWALLA LICI JIOFIN HDFCAMC ANGELONE "
+                          "CDSL BSE MCX CAMS KFINTECH NUVAMA 360ONE IIFL ABCAPITAL LTF SAMMAANCAP PNBHOUSING HUDCO IREDA "
+                          "BAJAJHFL PAYTM POLICYBZR MFSL",
+    "IT": "INFY TCS WIPRO HCLTECH TECHM LTIM MPHASIS PERSISTENT COFORGE OFSS KPITTECH TATAELXSI TATATECH LTTS CYIENT NAUKRI",
+    "Auto": "TATAMOTORS TMPV TMCV M&M MARUTI BAJAJ-AUTO HEROMOTOCO EICHERMOT TVSMOTOR ASHOKLEY BHARATFORG MOTHERSON BOSCHLTD "
+            "EXIDEIND SONACOMS TIINDIA UNOMINDA APOLLOTYRE BALKRISIND MRF ESCORTS",
+    "Pharma": "SUNPHARMA DRREDDY CIPLA DIVISLAB LUPIN AUROPHARMA ZYDUSLIFE TORNTPHARM ALKEM BIOCON GLENMARK MANKIND "
+              "LAURUSLABS GRANULES IPCALAB ABBOTINDIA APOLLOHOSP MAXHEALTH FORTIS SYNGENE PPLPHARMA",
+    "Energy & power": "RELIANCE NTPC POWERGRID ONGC BPCL IOC HINDPETRO GAIL PETRONET OIL TATAPOWER ADANIGREEN ADANIENSOL "
+                      "ADANIPOWER NHPC SJVN JSWENERGY TORNTPOWER CESC INOXWIND SUZLON IGL MGL COALINDIA WAAREEENER "
+                      "PREMIERENE NTPCGREEN",
+    "Metals": "TATASTEEL HINDALCO JSWSTEEL JINDALSTEL SAIL VEDL NATIONALUM NMDC HINDZINC APLAPOLLO HINDCOPPER",
+    "FMCG": "ITC HINDUNILVR NESTLEIND BRITANNIA DABUR MARICO GODREJCP COLPAL TATACONSUM UNITDSPR VBL PATANJALI GODFRYPHLP",
+    "Capital goods": "HAL BEL LT SIEMENS ABB BHEL CGPOWER CUMMINSIND POLYCAB KEI BDL MAZDOCK SOLARINDS SUPREMEIND ASTRAL "
+                     "KAYNES",
+    "Consumer & retail": "TRENT DIXON PIDILITIND PAGEIND TITAN ASIANPAINT BERGEPAINT DMART NYKAA ETERNAL ZOMATO SWIGGY "
+                         "KALYANKJIL VOLTAS HAVELLS BLUESTARCO CROMPTON JUBLFOOD IRCTC INDHOTEL AMBER PGEL",
+    "Cement & chemicals": "ULTRACEMCO SHREECEM AMBUJACEM ACC DALBHARAT GRASIM PIIND UPL SRF DEEPAKNTR TATACHEM",
+    "Realty": "DLF GODREJPROP LODHA OBEROIRLTY PRESTIGE PHOENIXLTD",
+    "Telecom & media": "BHARTIARTL IDEA INDUSTOWER TATACOMM HFCL",
+    "Infra & logistics": "ADANIPORTS ADANIENT GMRAIRPORT CONCOR DELHIVERY INDIGO RVNL NBCC IRB",
+}.items():
+    SECTOR_OF.update(dict.fromkeys(_names.split(), _sector))
+SECTORS = list(dict.fromkeys([*derivs_sample.SECTORS, *SECTOR_OF.values(), "Other"]))
+
+_lock = threading.Lock()
+_snap = {"at": 0.0, "underlyings": [], "chains": {}, "expiry": None, "since": None}
+
+
+def status():
+    return kite_chain.status()
+
+
+def _prev_gap(today):
+    """Calendar days back to the previous weekday's close (holidays aren't known here)."""
+    return 3 if today.weekday() == 0 else 2 if today.weekday() == 6 else 1
+
+
+def _atm_iv(rows, spot):
+    atm = min(rows, key=lambda x: abs(x["strike"] - spot))
+    ivs = [s["iv"] for s in (atm["CE"], atm["PE"]) if s["iv"]]
+    return sum(ivs) / len(ivs) if ivs else None
+
+
+def _iv_then(q, contracts, prev_spot, dte):
+    """ATM IV (%) from yesterday's closing prices, against yesterday's spot close."""
+    K, ce, pe = min(contracts, key=lambda c: abs(c[0] - prev_spot))
+    T = kite_chain._years(dte + _prev_gap(kite_chain._today()))
+    ivs = []
+    for inst, kind in ((ce, "CE"), (pe, "PE")):
+        close = ((q.get(inst["key"]) or {}).get("ohlc") or {}).get("close") or 0
+        v = kite_chain._iv(close, prev_spot, K, T, kind)
+        if v:
+            ivs.append(v * 100)
+    return sum(ivs) / len(ivs) if ivs else None
+
+
+def _refresh():
+    book, spots = kite_chain._book(), kite_chain._spots()
+    plans, keys = [], []
+    for u in kite_chain.underlyings():
+        b = book[u["symbol"]]
+        near = min(b["exp"])
+        spot, contracts, fut = kite_chain._contracts(u["symbol"], near, SECTOR_STRIKES)
+        if not contracts:
+            continue
+        futs = [f["key"] for f in b["fut"].values()]
+        plans.append((u, near, spot, contracts, fut, futs))
+        keys += [i["key"] for _, ce, pe in contracts for i in (ce, pe)] + futs
+    q = kite_chain._quote(keys)  # one pass, batched 500 to a call by kite_client
+    base = kite_chain._oi_baseline({k: int(q[k].get("oi") or 0) for *_, futs in plans for k in futs if k in q})
+
+    out, chains, nears = [], {}, Counter()
+    for u, near, spot, contracts, fut, futs in plans:
+        c = kite_chain.build(near, spot, contracts, fut, q)
+        now_oi = sum(int(q[k].get("oi") or 0) for k in futs if k in q)
+        then_oi = sum(base[k][0] for k in futs if k in base)
+        prev_spot = (spots[u["symbol"]].get("ohlc") or {}).get("close") or spot
+        iv_now, iv_then = _atm_iv(c["rows"], spot), _iv_then(q, contracts, prev_spot, c["dte"])
+        out.append({**u, "sector": "Index" if u["index"] else SECTOR_OF.get(u["symbol"], "Other"),
+                    "fut_oi_chg": (now_oi - then_oi) / then_oi * 100 if then_oi else 0.0,
+                    "iv_chg": (iv_now - iv_then) / iv_then * 100 if iv_now and iv_then else 0.0})
+        chains[u["symbol"]] = c
+        if not u["index"]:
+            nears[near] += 1
+    since = max((base[k][1] for k in base), default=None)
+    expiry = kite_chain._label(nears.most_common(1)[0][0]) if nears else None
+    _snap.update(at=time.monotonic(), underlyings=out, chains=chains, expiry=expiry, since=since)
+
+
+def _fresh():
+    with _lock:
+        if time.monotonic() - _snap["at"] > TTL:
+            _refresh()
+        return _snap
+
+
+# ── The source interface derivs.py reads ───────────────
+def underlyings():
+    """kite_chain's underlyings with a sector, fut_oi_chg (%) and iv_chg (%)."""
+    return _fresh()["underlyings"]
+
+
+def expiries(symbol):
+    """Only the expiry the tab uses: the nearest."""
+    b = kite_chain._book().get(symbol)
+    return [kite_chain._label(min(b["exp"]))] if b else []
+
+
+def chain(symbol, expiry):
+    return _fresh()["chains"][symbol]
+
+
+def near_expiry():
+    """The stocks' nearest expiry, for the tab's heading (index weeklies expire sooner)."""
+    return _fresh()["expiry"]
+
+
+def oi_since():
+    """"HH:MM" IST of the futures OI reading the change is measured from."""
+    return _fresh()["since"]
+
+
+del _sector, _names

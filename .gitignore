@@ -216,3 +216,5 @@ results/
 .playwright-mcp/
 .claude/
 web/public/derivs/
+.kite_session.json
+.kite_cache/

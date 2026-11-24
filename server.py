@@ -11,11 +11,12 @@ from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from derivs import router as derivs_router
+from kite_client import KiteError
 from scanner import Scan, load_last, market_open
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -24,6 +25,12 @@ app = FastAPI(title="Put screener")
 # The Next.js app (web/, port 3000) reads /api/derivs from the browser.
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], allow_methods=["GET"])
 state = {"scan": load_last()}
+
+
+@app.exception_handler(KiteError)
+def kite_error(_request, e: KiteError):
+    """Kite failures (not logged in, session expired, rate limit) reach the web app as a readable message."""
+    return JSONResponse({"detail": str(e)}, status_code=e.status)
 
 
 class ScanRequest(BaseModel):

@@ -28,8 +28,9 @@ phones) links the five tabs; its footer edits the profile and shows where each d
   a % of margin. **Execute** opens the risk appetite check with a hedge suggestion; "Execute trade" or "Execute with
   hedge" adds it to Positions.
 - **Sectoral analysis** (`/sectors`) and **Option chain** (`/chain`): charts and the three.js 3D view over
-  `lib/derivs.ts`, which calls the API. Sectors are sample data; the chain switches to your own API on the server
-  (`DERIVS_CHAIN_SOURCE` in `derivs.py`). `NEXT_PUBLIC_DERIVS_API` says where the API runs.
+  `lib/derivs.ts`, which calls the API. Both are sample data until the server runs with a live source
+  (`DERIVS_CHAIN_SOURCE` in `derivs.py`; `kite_chain` switches both tabs to Kite, read only).
+  `NEXT_PUBLIC_DERIVS_API` says where the API runs.
 
 Positions are a made-up sample book in `lib/data.ts` (P&L and change are worked out from qty, average and LTP);
 screener rows come from NSE screener screenshots and a scan CSV. Orders are simulated. Choices are saved in the
