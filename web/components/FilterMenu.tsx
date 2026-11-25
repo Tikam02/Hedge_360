@@ -128,15 +128,16 @@ const pctText = (v: number) => `${+v.toFixed(2)}%`;
 /**
  * "At least X%" filter with a slider. The histogram shows where the options sit (rows already narrowed by the
  * other filters), and everything at or above the thumb is highlighted, so the selected side is always the right side.
- * A value at `lo` means no limit.
+ * At `lo` every option passes. `base` is the starting value (default `lo`): the button stands out once it moves.
  */
-export function RangeMenu({ id, label, title, value, onChange, lo, hi, step, values, presets, inline }: {
-  id: string; label: string; title: string; value: number; onChange: (v: number) => void;
+export function RangeMenu({ id, label, title, value, base, onChange, lo, hi, step, values, presets, inline }: {
+  id: string; label: string; title: string; value: number; base?: number; onChange: (v: number) => void;
   lo: number; hi: number; step: number; values: number[]; presets: Array<{ v: number; l: string }>; inline?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useOutside(open, () => setOpen(false));
-  const active = value > lo;
+  const start = base ?? lo;
+  const active = value !== start;
   const body = <RangeBody id={inline ? `${id}-sheet` : id} title={title} value={value} onChange={onChange} lo={lo} hi={hi} step={step} values={values} presets={presets} />;
   if (inline) {
     return <fieldset className="fx"><legend>{label}</legend>{body}</fieldset>;
@@ -144,12 +145,12 @@ export function RangeMenu({ id, label, title, value, onChange, lo, hi, step, val
   return (
     <div className="fm" ref={ref}>
       <button type="button" className={`fm-btn${active ? ' on' : ''}`} aria-expanded={open} aria-haspopup="true" onClick={() => setOpen((o) => !o)}>
-        <span className="fm-l">{label}</span><span className="fm-v">{active ? `≥ ${pctText(value)}` : 'Any'}</span><ChevronDown size={16} aria-hidden="true" />
+        <span className="fm-l">{label}</span><span className="fm-v">≥ {pctText(value)}</span><ChevronDown size={16} aria-hidden="true" />
       </button>
       {open && (
         <div className="fm-pop rng-pop" role="group" aria-label={title}>
           {body}
-          {active && <button type="button" className="fm-clear" onClick={() => { onChange(lo); setOpen(false); }}>Clear {label}</button>}
+          {active && <button type="button" className="fm-clear" onClick={() => { onChange(start); setOpen(false); }}>Reset to ≥ {pctText(start)}</button>}
         </div>
       )}
     </div>
@@ -165,12 +166,11 @@ function RangeBody({ id, title, value, onChange, lo, hi, step, values, presets }
     values.filter((x) => x >= lo + i * w && (i === BINS - 1 ? x <= hi : x < lo + (i + 1) * w)).length);
   const peak = Math.max(1, ...counts);
   const n = values.filter((x) => x >= value).length;
-  const active = value > lo;
   return (
     <div className="rng">
       <div className="rng-top">
         <label htmlFor={id}>{title}</label>
-        <output htmlFor={id}>{active ? `≥ ${pctText(value)}` : 'Any'}</output>
+        <output htmlFor={id}>≥ {pctText(value)}</output>
       </div>
       <div className="rng-hist" aria-hidden="true">
         {counts.map((c, i) => (
@@ -178,10 +178,10 @@ function RangeBody({ id, title, value, onChange, lo, hi, step, values, presets }
         ))}
       </div>
       <input id={id} type="range" min={lo} max={hi} step={step} value={value} onChange={(e) => onChange(+e.target.value)}
-        aria-valuetext={active ? `at least ${pctText(value)}` : 'any'} style={{ ['--fill' as string]: `${((value - lo) / (hi - lo)) * 100}%` }} />
+        aria-valuetext={`at least ${pctText(value)}`} style={{ ['--fill' as string]: `${((value - lo) / (hi - lo)) * 100}%` }} />
       <div className="rng-scale" aria-hidden="true"><span>{pctText(lo)}</span><span>{pctText(hi)}</span></div>
       <div className="rng-chips" role="group" aria-label="Presets">
-        {[{ v: lo, l: 'Any' }, ...presets].map((p) => (
+        {[{ v: lo, l: pctText(lo) }, ...presets.filter((p) => p.v !== lo)].map((p) => (
           <button type="button" key={p.v} aria-pressed={value === p.v} onClick={() => onChange(p.v)}>{p.l}</button>
         ))}
       </div>

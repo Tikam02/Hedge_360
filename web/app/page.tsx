@@ -4,6 +4,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowRight, CalendarClock, Check, Clock3, Coffee, MonitorDot, Zap } from 'lucide-react';
 import { BrandMark } from '@/components/Shell';
 import { OPTIONS, POSITIONS } from '@/lib/data';
+import { useSignedIn } from '@/lib/account';
 import { useStore, type TimeAvail } from '@/lib/store';
 import { APPETITE_LABEL, RULES, fmt, words, type Appetite } from '@/lib/util';
 import { Suggestion } from '@/components/HedgeTicket';
@@ -29,6 +30,7 @@ function Onboarding() {
   const router = useRouter();
   const params = useSearchParams();
   const editing = params.get('edit') === '1';
+  const signedIn = useSignedIn();
   const { ready, profile, setProfile, showToast } = useStore();
   const [step, setStep] = useState(0);
   const [capText, setCapText] = useState('');
@@ -45,10 +47,11 @@ function Onboarding() {
     if (step < 2) { setStep(step + 1); return; }
     setProfile({ done: true });
     showToast(`Profile saved. Trades are checked against a ${APPETITE_LABEL[profile.appetite ?? 'moderate'].toLowerCase()} risk appetite.`);
-    router.push('/dashboard');
+    router.push(editing ? '/profile' : '/dashboard');
   };
   const canNext = step === 0 || (step === 1 && !!profile.time) || (step === 2 && !!profile.appetite);
   const sample = POSITIONS.find((p) => p.name === 'SENSEX 2nd w DEC 85000 CE')!;
+  if (!signedIn || !ready) return null;
 
   return (
     <div className="ob">

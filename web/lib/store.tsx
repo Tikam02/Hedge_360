@@ -1,6 +1,8 @@
 'use client';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { POSITIONS, type Leg, type Position } from './data';
+import { STATIC } from './derivs';
+import { api, useAccount, type User } from './account';
 import type { Appetite } from './util';
 import type { SuggestMode } from './suggest';
 
@@ -17,7 +19,24 @@ interface State {
 }
 
 const EMPTY: State = { profile: { capital: null, time: null, appetite: null, done: false }, executed: {}, hedged: {}, added: [], suggestMode: 'appetite' };
+/**
+ * The demo book (executed trades, hedges, added positions) lives in this browser under KEY:<account id>. The trading
+ * profile belongs to the account and is saved on the server; the Pages demo has no accounts and keeps it all under KEY.
+ * Before accounts the state sat under KEY alone: the first account to sign in here takes it over, profile included
+ * if that account hasn't set one up yet.
+ */
 const KEY = 'kavach.v4';
+
+function readLocal(key: string): Partial<State> | null {
+  const raw = localStorage.getItem(key);
+  if (raw) return JSON.parse(raw);
+  if (key !== KEY) return null;
+  // v4 swapped in a new sample book, so trades and hedges saved against the old one are dropped; the profile carries over.
+  const old = localStorage.getItem('kavach.v3') ?? localStorage.getItem('kavach.v2');
+  if (!old) return null;
+  const o = JSON.parse(old);
+  return { profile: o.profile ?? EMPTY.profile, suggestMode: o.suggestMode ?? EMPTY.suggestMode };
+}
 
 interface Ctx extends State {
   ready: boolean;
@@ -35,24 +54,60 @@ interface Ctx extends State {
 const StoreCtx = createContext<Ctx | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
+  const { user, ready: signedInChecked, setUser } = useAccount();
   const [s, setS] = useState<State>(EMPTY);
-  const [ready, setReady] = useState(false);
+  /** Whose state is loaded: 'local' in the Pages demo, else the account id. */
+  const [loaded, setLoaded] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const owner = STATIC ? 'local' : user ? String(user.id) : null;
+  const key = owner === 'local' ? KEY : `${KEY}:${owner}`;
+  const ready = owner !== null && loaded === owner;
+  /** The profile as the server last had it, so only real changes are saved. */
+  const sent = useRef('');
+  const save = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (!signedInChecked || owner === null) { setLoaded(null); return; }
+    let next: State = EMPTY;
     try {
-      const raw = localStorage.getItem(KEY);
-      if (raw) setS({ ...EMPTY, ...JSON.parse(raw) });
-      else {
-        // v4 swapped in a new sample book, so trades and hedges saved against the old one are dropped; the profile carries over.
-        const old = localStorage.getItem('kavach.v3') ?? localStorage.getItem('kavach.v2');
-        if (old) { const o = JSON.parse(old); setS({ ...EMPTY, profile: o.profile ?? EMPTY.profile, suggestMode: o.suggestMode ?? EMPTY.suggestMode }); }
-      }
-    } catch { /* storage blocked */ }
-    setReady(true);
-  }, []);
-  useEffect(() => { if (ready) try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* storage blocked */ } }, [s, ready]);
+      const mine = readLocal(key);
+      const legacy = owner !== 'local' && !mine ? readLocal(KEY) : null;
+      next = { ...EMPTY, ...(mine ?? legacy ?? {}) };
+      if (legacy) localStorage.removeItem(KEY);
+      if (user) next.profile = legacy?.profile?.done && !user.profile.done ? legacy.profile : user.profile;
+    } catch {
+      if (user) next = { ...EMPTY, profile: user.profile }; // storage blocked
+    }
+    sent.current = user ? JSON.stringify(user.profile) : '';
+    setS(next);
+    setLoaded(owner);
+    // Load once per account; later changes to `user` come from this store's own saves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signedInChecked, owner]);
+
+  useEffect(() => {
+    if (!ready) return;
+    try { localStorage.setItem(key, JSON.stringify(owner === 'local' ? s : { ...s, profile: undefined })); } catch { /* storage blocked */ }
+  }, [s, ready, key, owner]);
+
+  // Profile changes go to the server shortly after the last one (onboarding saves on every keystroke), and at once
+  // if the page is closing.
+  useEffect(() => {
+    if (!ready || STATIC) return;
+    const body = JSON.stringify(s.profile);
+    if (body === sent.current) return;
+    const push = (keepalive = false) => {
+      if (save.current) clearTimeout(save.current);
+      save.current = null;
+      sent.current = body;
+      api<User>('/api/me/profile', { method: 'PUT', body: s.profile, keepalive }).then(setUser).catch(() => { sent.current = ''; });
+    };
+    save.current = setTimeout(push, 400);
+    const onHide = () => push(true);
+    window.addEventListener('pagehide', onHide);
+    return () => { window.removeEventListener('pagehide', onHide); if (save.current) clearTimeout(save.current); };
+  }, [s.profile, ready, setUser]);
 
   const showToast = useCallback((m: string) => {
     setToast(m);

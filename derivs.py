@@ -7,20 +7,27 @@ and the strike × expiry grid for the 3D view. Nothing is fetched from NSE.
 Two data sources, each a module with three functions: underlyings(), expiries(symbol) and chain(symbol, expiry)
 (shapes documented in derivs_sample.py). A chain source may also offer margins(), prefetch() and status(), as
 kite_chain.py does:
-  - Sectors come from the sample generator, derivs_sample, unless the chain source names a sector source of its own
-    (SECTOR_SOURCE): kite_chain names kite_sectors, so the Kite switch below moves both tabs to live data.
-  - The option chain, the symbol picker and the 3D grid come from the module named by DERIVS_CHAIN_SOURCE,
-    for example one that calls your own stock-derivatives API. Unset, they use the sample too. Your module only
-    returns raw chain rows; totals, PCR, max pain, ATM IV and the grids are still worked out here.
+  - The option chain, the symbol picker and the 3D grid come from the module named by DERIVS_CHAIN_SOURCE, for
+    example one that calls your own stock-derivatives API. Your module only returns raw chain rows; totals, PCR,
+    max pain, ATM IV and the grids are still worked out here.
+  - Unset, they come from Kite (kite_chain, read only) while a Zerodha session is live, which the web app's Profile
+    page sets up (kite_auth.py), and from the sample generator, derivs_sample, otherwise. Checked on every request,
+    so logging in or out switches the tabs without a restart.
+  - Sectors follow the chain source: one that names a sector source of its own (SECTOR_SOURCE, as kite_chain names
+    kite_sectors) supplies them, any other gets the sample.
 
+    .venv/bin/uvicorn server:app --port 8060                                   # Kite when logged in, else sample
     DERIVS_CHAIN_SOURCE=my_chain .venv/bin/uvicorn server:app --port 8060
-    DERIVS_CHAIN_SOURCE=kite_chain .venv/bin/uvicorn server:app --port 8060   # Kite Connect, read only
+    DERIVS_CHAIN_SOURCE=derivs_sample .venv/bin/uvicorn server:app --port 8060 # always the sample
 
-    GET /api/derivs/health                          where sectors and the chain come from (sample or live)
+    GET /api/derivs/health                          where sectors and the chain come from, and the Zerodha state
     GET /api/derivs/sectors                         sector and index derivatives summary
     GET /api/derivs/symbols                         underlyings for the chain picker
     GET /api/derivs/chain?symbol=SBIN&expiry=...    one expiry's chain with totals and max pain
     GET /api/derivs/surface?symbol=SBIN             OI and IV on a strike × expiry grid
+    GET /api/derivs/screener[?rescan=1]             OTM stock options to sell, from the sector source's chains
+    GET /api/derivs/margin?symbol&expiry&strike&type  Kite's margin to sell one lot of one option (no order placed)
+    GET /api/derivs/fno                             the F&O stock list: who is in, leaving, joined or left
 """
 
 import importlib
@@ -28,20 +35,36 @@ import logging
 import os
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import derivs_sample
+import kite_chain
+from accounts import current_user
+import kite_client
+import kite_history
+import kite_sectors
 from pe import MARGIN_PCT
 from scanner import IST
 
-router = APIRouter(prefix="/api/derivs", tags=["derivatives"])
+# Signed-in users only (accounts.py). The functions below are plain Python, so export_static.py calls them directly.
+router = APIRouter(prefix="/api/derivs", tags=["derivatives"], dependencies=[Depends(current_user)])
 log = logging.getLogger("derivs")
 
-chain_source = importlib.import_module(os.environ["DERIVS_CHAIN_SOURCE"]) if os.environ.get("DERIVS_CHAIN_SOURCE") else derivs_sample
-sector_source = importlib.import_module(getattr(chain_source, "SECTOR_SOURCE", "derivs_sample"))
+_fixed = importlib.import_module(os.environ["DERIVS_CHAIN_SOURCE"]) if os.environ.get("DERIVS_CHAIN_SOURCE") else None
+
+
+def chain_src():
+    """DERIVS_CHAIN_SOURCE if set; else Kite while a Zerodha session is live, the sample otherwise."""
+    return _fixed or (kite_chain if kite_client.connected() else derivs_sample)
+
+
+def sector_src():
+    return importlib.import_module(getattr(chain_src(), "SECTOR_SOURCE", "derivs_sample"))
+
 
 BUILD_UPS = ["Long build-up", "Short covering", "Short build-up", "Long unwinding"]
 SURFACE_EXPIRIES = 8  # the 3D view shows the nearest few; index weeklies would otherwise crowd it
+SCREEN_OTM = kite_sectors.SCREEN_OTM  # % out of the money the Screener lists: nearer is too risky to sell, further pays next to nothing
 
 
 def build_up(chg, oi_chg):
@@ -55,8 +78,8 @@ def _meta(src):
     return {"source": "sample" if src is derivs_sample else "live", "asOf": datetime.now(IST).isoformat(timespec="seconds")}
 
 
-def _underlying(symbol):
-    u = next((x for x in chain_source.underlyings() if x["symbol"] == symbol.upper()), None)
+def _underlying(src, symbol):
+    u = next((x for x in src.underlyings() if x["symbol"] == symbol.upper()), None)
     if not u:
         raise HTTPException(404, f"Unknown symbol {symbol}")
     return u
@@ -99,9 +122,9 @@ def chain_summary(src, u, expiry):
     }
 
 
-def _stock(u):
+def _stock(src, u):
     """One underlying's near-expiry numbers. Option OI notional is in ₹ crore (contracts × lot × spot)."""
-    _, s = chain_summary(sector_source, u, sector_source.expiries(u["symbol"])[0])
+    _, s = chain_summary(src, u, src.expiries(u["symbol"])[0])
     cr = lambda oi: oi * u["lot"] * u["spot"] / 1e7  # noqa: E731
     return {
         "symbol": u["symbol"], "sector": u["sector"], "spot": u["spot"], "chg": round(u["chg"], 2),
@@ -114,12 +137,14 @@ def _stock(u):
 @router.get("/health")
 def health():
     state = lambda src: src.status() if hasattr(src, "status") else _meta(src)["source"]  # noqa: E731
-    return {"ok": True, "sectors": state(sector_source), "chain": state(chain_source)}
+    return {"ok": True, "sectors": state(sector_src()), "chain": state(chain_src()),
+            "kite": "live" if kite_client.connected() else "offline"}
 
 
 @router.get("/sectors")
 def sectors():
-    stocks = [_stock(u) for u in sector_source.underlyings()]
+    sector_source = sector_src()
+    stocks = [_stock(sector_source, u) for u in sector_source.underlyings()]
     out = []
     for name in sector_source.SECTORS:
         group = [s for s in stocks if s["sector"] == name]
@@ -150,6 +175,7 @@ def sectors():
 
 @router.get("/symbols")
 def symbols():
+    chain_source = chain_src()
     return {**_meta(chain_source), "marginPct": MARGIN_PCT, "symbols": [
         {"symbol": u["symbol"], "sector": u["sector"], "index": u["index"], "spot": u["spot"],
          "chg": round(u["chg"], 2), "lot": u["lot"], "expiries": chain_source.expiries(u["symbol"])}
@@ -158,7 +184,8 @@ def symbols():
 
 @router.get("/chain")
 def chain(symbol: str = Query(..., max_length=20), expiry: str | None = None):
-    u = _underlying(symbol)
+    chain_source = chain_src()
+    u = _underlying(chain_source, symbol)
     expiries = chain_source.expiries(u["symbol"])
     expiry = expiry or expiries[0]
     if expiry not in expiries:
@@ -178,11 +205,27 @@ def chain(symbol: str = Query(..., max_length=20), expiry: str | None = None):
                       "put": _side(x["PE"], m.get((x["strike"], "PE")))} for x in c["rows"]]}
 
 
+@router.get("/margin")
+def margin(symbol: str = Query(..., max_length=20), expiry: str = Query(..., max_length=20), strike: float = Query(..., gt=0),
+           type: str = Query(..., pattern="^(CE|PE)$")):
+    """Kite's margin to sell one lot of one option (NRML, on its own), for the Screener's trade check: its rows reach
+    strikes the chain page doesn't show. A calculation only; no order is placed. {margin: ₹, or null without one}."""
+    chain_source = chain_src()
+    if not hasattr(chain_source, "margins"):
+        return {"margin": None}
+    u = _underlying(chain_source, symbol)
+    if expiry not in chain_source.expiries(u["symbol"]):
+        raise HTTPException(404, f"No {expiry} expiry for {u['symbol']}")
+    K = int(strike) if float(strike).is_integer() else strike
+    return {"margin": chain_source.margins(u["symbol"], expiry, [strike], (type,)).get((K, type))}
+
+
 @router.get("/surface")
 def surface(symbol: str = Query(..., max_length=20)):
     """OI per strike and expiry for both sides, and the IV smile per expiry (out-of-the-money side: puts below
     spot, calls above). Strikes are the union across expiries; a strike missing from an expiry is null."""
-    u = _underlying(symbol)
+    chain_source = chain_src()
+    u = _underlying(chain_source, symbol)
     expiries = chain_source.expiries(u["symbol"])[:SURFACE_EXPIRIES]
     if hasattr(chain_source, "prefetch"):
         chain_source.prefetch(u["symbol"], expiries)
@@ -195,3 +238,65 @@ def surface(symbol: str = Query(..., max_length=20)):
             "expiries": [{"expiry": e, "dte": c["dte"]} for e, c in chains],
             "callOi": grid(lambda x: x["CE"]["oi"]), "putOi": grid(lambda x: x["PE"]["oi"]),
             "iv": grid(lambda x: _r((x["PE"] if x["strike"] < spot else x["CE"])["iv"], 2))}
+
+
+def screener_rows(src, year=None):
+    """Every stock's out-of-the-money options on its nearest expiry, in the web app's OptionRow shape. Margin is the
+    estimate (strike × lot × MARGIN_PCT): Kite's own figure takes a call per chain, so the trade check fetches it.
+    year: {SYMBOL: (52-week high, low)} (kite_history); without it the underlying's own hi52 / lo52 (the sample's)."""
+    rows = []
+    for u in src.underlyings():
+        if u["index"]:
+            continue
+        expiry = src.expiries(u["symbol"])[0]
+        c = src.chain(u["symbol"], expiry)
+        spot = c["spot"]
+        hi52, lo52 = (year or {}).get(u["symbol"]) or (u.get("hi52"), u.get("lo52"))
+        for x in c["rows"]:
+            K = x["strike"]
+            for kind in ("PE", "CE"):
+                s = x[kind]
+                otm = ((spot - K) if kind == "PE" else (K - spot)) / spot * 100
+                if not (SCREEN_OTM[0] <= otm <= SCREEN_OTM[1]) or not s["ltp"] or not s["oi"]:
+                    continue
+                margin = round(K * u["lot"] * MARGIN_PCT / 100)
+                total = round(s["ltp"] * u["lot"], 2)
+                rows.append({
+                    "id": f"chain-{u['symbol']}-{expiry}-{int(K) if float(K).is_integer() else K}-{kind}", "symbol": u["symbol"], "type": kind, "cmp": spot,
+                    "strike": K, "otm": round(otm, 2), "prem": s["ltp"], "lot": u["lot"], "totalPrem": total,
+                    "margin": margin, "premPct": round(total / margin * 100, 2) if margin else 0, "expiry": expiry,
+                    "fut": round(c["fut"], 2), "hi52": hi52, "lo52": lo52, "pe": None, "iv": _r(s["iv"], 2) or 0,
+                    "oi": s["oi"], "src": "chain", "est": ["margin"],
+                })
+    return rows
+
+
+@router.get("/fno")
+def fno():
+    """Live: the F&O stocks in today's Kite instrument list, with the joins and exits seen since tracking began
+    (kite_chain.fno_list). Sample: the sample's stocks, nothing leaving."""
+    src = chain_src()
+    if hasattr(src, "fno_list"):
+        f = src.fno_list()
+        f["stocks"] = [{**s, "sector": kite_sectors.SECTOR_OF.get(s["symbol"], "Other")} for s in f["stocks"]]
+        return {**_meta(src), **f}
+    us = src.underlyings()
+    return {**_meta(src), "stocks": [{"symbol": u["symbol"], "sector": u["sector"], "lot": u["lot"],
+                                      "lastExpiry": src.expiries(u["symbol"])[-1], "leaving": False, "since": None}
+                                     for u in sorted(us, key=lambda u: u["symbol"]) if not u["index"]],
+            "indices": [u["symbol"] for u in us if u["index"]], "unmatched": [], "changes": [], "trackedSince": None}
+
+
+@router.get("/screener")
+def screener(rescan: bool = False):
+    src = sector_src()
+    meta = _meta(src)
+    # The live source answers from one pass (the last one, or a new one on Re-scan), with the 52-week range from the
+    # stored daily bars plus today's high and low from the pass.
+    live = hasattr(src, "snapshot")
+    if not live:
+        return {**meta, "scanned": meta["asOf"], "otm": list(SCREEN_OTM), "marginPct": MARGIN_PCT, "rows": screener_rows(src)}
+    view = src.snapshot(rescan)
+    year = kite_history.ranges({u["symbol"]: (u.get("day_high"), u.get("day_low")) for u in view.underlyings()})
+    return {**meta, "scanned": view.scanned, "otm": list(SCREEN_OTM), "marginPct": MARGIN_PCT,
+            "history": kite_history.status(), "rows": screener_rows(view, year)}

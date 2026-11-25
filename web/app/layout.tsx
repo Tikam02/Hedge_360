@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import { Inter, Manrope } from 'next/font/google';
+import { AccountProvider } from '@/lib/account';
 import { StoreProvider } from '@/lib/store';
 import './globals.css';
 
@@ -16,7 +17,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className={`${inter.variable} ${manrope.variable}`}>
       <body>
-        <StoreProvider>{children}</StoreProvider>
+        <AccountProvider><StoreProvider>{children}</StoreProvider></AccountProvider>
       </body>
     </html>
   );

@@ -1,0 +1,24 @@
+# PostgreSQL for Hedge 360's accounts, profiles, notes and journal (db.py).
+#   docker compose up -d
+# Listens on 127.0.0.1:5434 only. Set POSTGRES_PASSWORD in .env (git-ignored) to change the local dev password, and
+# DATABASE_URL to match when you run the API.
+name: hedge360
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hedge360
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hedge360}
+      POSTGRES_DB: hedge360
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - hedge360-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hedge360 -d hedge360"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  hedge360-pg:

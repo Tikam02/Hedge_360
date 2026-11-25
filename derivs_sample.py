@@ -140,6 +140,12 @@ def _today():
     return datetime.now(IST).date()
 
 
+def _year(symbol, spot):
+    """A 52-week high and low around the spot, from a generator of their own so the other numbers don't move."""
+    r = random.Random(f"{symbol}|52w")
+    return {"hi52": round(spot * (1.03 + 0.32 * r.random()), 2), "lo52": round(spot * (0.94 - 0.30 * r.random()), 2)}
+
+
 # ── Generator (cached per calendar day, since days to expiry move the prices) ──
 @lru_cache(maxsize=4)
 def _underlyings(today):
@@ -161,7 +167,7 @@ def _underlyings(today):
             "chg": chg, "lot": lot, "step": step_for(spot, symbol), "atm_iv": atm_iv,
             "iv_chg": _around(r, 4 if chg < 0 else -2.5, 3),
             "fut_oi_chg": _around(r, oi, 1 if index else 4),
-            "pcr": min(1.7, max(0.45, _around(r, pcr, 0.16))), "liq": liq,
+            "pcr": min(1.7, max(0.45, _around(r, pcr, 0.16))), "liq": liq, **_year(symbol, spot),
         })
     return tuple(out)
 
@@ -222,7 +228,8 @@ def _chain(symbol, expiry, today):
 # ── The source interface derivs.py reads ───────────────
 def underlyings():
     """Every F&O underlying as a dict. A chain source must give: symbol, sector ('Index' for indices),
-    index (bool), spot, chg (price change %), lot, step (strike gap). Sectors also read fut_oi_chg and iv_chg."""
+    index (bool), spot, chg (price change %), lot, step (strike gap). Sectors also read fut_oi_chg and iv_chg; the
+    Screener reads hi52 / lo52 (52-week high and low) when it has no other source."""
     return _underlyings(_today())
 
 

@@ -1,5 +1,6 @@
 """
-Read-only Kite Connect client for the analytics API: the instrument list, market quotes and the margin calculator.
+Read-only Kite Connect client for the analytics API: the instrument list, market quotes, the margin calculator and
+day candles (kite_history.py keeps them for the Screener's 52-week range).
 
 It cannot place, modify or cancel orders, or read positions or holdings: every request goes through _send, which
 refuses any path outside READ_ONLY before anything leaves the machine.
@@ -16,15 +17,32 @@ import gzip
 import io
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
 
 BASE_URL = "https://api.kite.trade"
+URL_BUDGET = 6000  # bytes of "i=..." per quote call; see KiteHTTPAPI._batched
+
+
+def _chunks(keys, size, budget):
+    """Consecutive slices of keys, each at most `size` long and `budget` bytes once URL-encoded as i=...&."""
+    batch, used = [], 0
+    for k in keys:
+        n = len(quote_plus(k)) + 3
+        if batch and (len(batch) >= size or used + n > budget):
+            yield batch
+            batch, used = [], 0
+        batch.append(k)
+        used += n
+    if batch:
+        yield batch
 SESSION_FILE = Path(__file__).resolve().parent / ".kite_session.json"
 
 # Kite access tokens are valid until 06:00 IST the next morning.
@@ -37,14 +55,17 @@ READ_ONLY = {
     ("POST", "/margins/orders"), ("POST", "/margins/basket"),
 }
 
-# Quote calls are paced at one a second, everything else at a few a second. Shared by every thread, because the
-# chain page asks for symbols, chain and the 3D grid at the same time.
-PACE = {"quote": 1.0, "other": 0.15}
-_last_call = {"quote": 0.0, "other": 0.0}
+# Day candles of one instrument: GET /instruments/historical/<token>/day, nothing else under /instruments/historical.
+HISTORY = re.compile(r"/instruments/historical/\d+/day")
+
+# Kite's limits: quotes one a second, historical candles three a second, everything else ten. Shared by every thread,
+# because the chain page asks for symbols, chain and the 3D grid at the same time.
+PACE = {"quote": 1.0, "history": 0.35, "other": 0.15}
+_last_call = {"quote": 0.0, "history": 0.0, "other": 0.0}
 _pace_lock = threading.Lock()
 
-NOT_CONNECTED = "Kite isn't connected. Set KITE_API_KEY and KITE_API_SECRET, then run: python kite_login.py"
-EXPIRED = "The Kite session expired at 06:00. Log in again: python kite_login.py"
+NOT_CONNECTED = "Zerodha isn't connected. Log in from the Profile page (or run: python kite_login.py)"
+EXPIRED = "The Kite session expired at 06:00. Log in again from the Profile page (or run: python kite_login.py)"
 
 
 class KiteError(Exception):
@@ -56,10 +77,10 @@ class KiteError(Exception):
 
 
 def allowed(method, path):
-    """GET /instruments/<exchange> is allowed too, but not /instruments/historical/... ."""
+    """Also GET /instruments/<exchange>, and GET day candles of one instrument (HISTORY); no other historical path."""
     if (method, path) in READ_ONLY:
         return True
-    return method == "GET" and path.startswith("/instruments/") and path.count("/") == 2
+    return method == "GET" and (path.startswith("/instruments/") and path.count("/") == 2 or bool(HISTORY.fullmatch(path)))
 
 
 def last_token_expiry(now=None):
@@ -96,7 +117,7 @@ def connected():
 
 
 def _pace(path):
-    kind = "quote" if path.startswith("/quote") else "other"
+    kind = "quote" if path.startswith("/quote") else "history" if HISTORY.fullmatch(path) else "other"
     with _pace_lock:
         wait = PACE[kind] - (time.monotonic() - _last_call[kind])
         if wait > 0:
@@ -151,10 +172,12 @@ class KiteHTTPAPI:
         return body.get("data")
 
     def _batched(self, path, instruments, size):
-        """Keys with no data (expired, or never traded) are simply missing from the answer."""
+        """Keys with no data (expired, or never traded) are simply missing from the answer. The keys go in the query
+        string, so a batch also stops at URL_BUDGET bytes: Kite's server answers 400 to a URL much over 8 KB, which
+        500 long F&O symbols pass."""
         out = {}
-        for i in range(0, len(instruments), size):
-            out.update(self._data(self._send("GET", path, params={"i": instruments[i:i + size]})) or {})
+        for batch in _chunks(instruments, size, URL_BUDGET):
+            out.update(self._data(self._send("GET", path, params={"i": batch})) or {})
         return out
 
     def quote(self, instruments):
@@ -175,6 +198,11 @@ class KiteHTTPAPI:
             raw = gzip.decompress(raw)
         return pd.read_csv(io.BytesIO(raw), dtype={"tradingsymbol": str, "name": str, "expiry": str},
                            keep_default_na=False)
+
+    def day_candles(self, token, start, end):
+        """Day candles [timestamp, open, high, low, close, volume] of one instrument, `start` to `end` (dates)."""
+        params = {"from": f"{start:%Y-%m-%d} 00:00:00", "to": f"{end:%Y-%m-%d} 23:59:59"}
+        return (self._data(self._send("GET", f"/instruments/historical/{int(token)}/day", params=params, timeout=30)) or {}).get("candles") or []
 
     def order_margins(self, orders, mode=None):
         """Margin for each order, counting the account's existing positions and open orders. No order is placed."""

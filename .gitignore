@@ -218,3 +218,5 @@ results/
 web/public/derivs/
 .kite_session.json
 .kite_cache/
+.kite_credentials.json
+.kite_secret.key

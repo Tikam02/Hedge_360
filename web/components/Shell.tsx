@@ -2,9 +2,11 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
-import { ChartScatter, ChevronRight, CircleCheck, LayoutDashboard, ListFilter, Menu, Shield, ShieldCheck, TableProperties, X } from 'lucide-react';
+import { ChartScatter, CircleCheck, LayoutDashboard, ListFilter, Menu, PlugZap, Shield, ShieldCheck, TableProperties, Tags, UserRound, X } from 'lucide-react';
+import { useAccount, useSignedIn } from '@/lib/account';
 import { useStore } from '@/lib/store';
-import { apiUrl } from '@/lib/derivs';
+import { Avatar, ProfileMenu } from './ProfileMenu';
+import { STATIC, apiUrl } from '@/lib/derivs';
 import { APPETITE_LABEL, words } from '@/lib/util';
 
 export function BrandMark({ size = 20 }: { size?: number }) {
@@ -20,19 +22,24 @@ export function Toast() {
 type Feed = 'live' | 'sample' | 'offline' | null;
 type Tab = { href: string; label: string; icon: ComponentType<{ size?: number; strokeWidth?: number; 'aria-hidden'?: boolean | 'true' }>; count?: number };
 
-/** Where the analytics server's sector and chain data come from. Checked once per page; never blocks the page. */
+/** Where the analytics server's sector and chain data come from, and whether Zerodha is connected (kite is absent
+ * from the Pages build's static health file). Checked once per page; never blocks the page. */
 function useFeeds() {
-  const [feeds, setFeeds] = useState<{ sectors: Feed; chain: Feed }>({ sectors: null, chain: null });
+  const [feeds, setFeeds] = useState<{ sectors: Feed; chain: Feed; kite?: Feed }>({ sectors: null, chain: null, kite: null });
   useEffect(() => {
     let dead = false;
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 4000);
-    fetch(apiUrl('/health'), { signal: ctl.signal })
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((d: { sectors: Feed; chain: Feed }) => { if (!dead) setFeeds({ sectors: d.sectors, chain: d.chain }); })
-      .catch(() => { if (!dead) setFeeds({ sectors: 'offline', chain: 'offline' }); })
-      .finally(() => clearTimeout(t));
-    return () => { dead = true; clearTimeout(t); ctl.abort(); };
+    const read = () => {
+      const t = setTimeout(() => ctl.abort(), 4000);
+      fetch(apiUrl('/health'), { signal: ctl.signal, credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : Promise.reject()))
+        .then((d: { sectors: Feed; chain: Feed; kite?: Feed }) => { if (!dead) setFeeds({ sectors: d.sectors, chain: d.chain, kite: d.kite }); })
+        .catch(() => { if (!dead) setFeeds({ sectors: 'offline', chain: 'offline' }); })
+        .finally(() => clearTimeout(t));
+    };
+    read();
+    window.addEventListener('kite-change', read); // the Profile page logged in or out of Zerodha
+    return () => { dead = true; ctl.abort(); window.removeEventListener('kite-change', read); };
   }, []);
   return feeds;
 }
@@ -69,8 +76,13 @@ function useDrawer() {
   return { open, setOpen, close, panel, opener };
 }
 
-/** App frame: sidebar on desktop, an icon rail on tablets, a top bar with a slide-out drawer on phones. Sends first-time visitors to onboarding. */
+/**
+ * App frame: sidebar on desktop, an icon rail on tablets, a top bar with a slide-out drawer on phones. Sends signed-out
+ * visitors to /login and first-time ones to onboarding.
+ */
 export default function Shell({ children }: { children: ReactNode }) {
+  const signedIn = useSignedIn();
+  const { user } = useAccount();
   const { ready, profile, positions } = useStore();
   const path = usePathname();
   const router = useRouter();
@@ -89,11 +101,13 @@ export default function Shell({ children }: { children: ReactNode }) {
       { href: '/screener', label: 'Screener', icon: ListFilter },
       { href: '/sectors', label: 'Sectoral analysis', icon: ChartScatter },
       { href: '/chain', label: 'Option chain', icon: TableProperties },
+      { href: '/tickers', label: 'Ticker Data', icon: Tags },
     ] },
+    { label: 'Account', tabs: [{ href: '/profile', label: 'Profile', icon: UserRound }] },
   ];
   const status: Array<[string, Feed]> = [['Positions', 'sample'], ['Sector data', feeds.sectors], ['Option chain', feeds.chain]];
-  const editProfile = () => { drawer.close(); router.push('/?edit=1'); };
   const { open, close } = drawer;
+  const who = user ? user.name || user.email.split('@')[0] : 'Demo trader';
 
   return (
     <div className="app">
@@ -121,14 +135,21 @@ export default function Shell({ children }: { children: ReactNode }) {
           ))}
         </nav>
         <div className="sb-foot">
-          <button type="button" className="sb-profile" onClick={editProfile} title="Edit your trading profile">
-            <span className={`sb-av ${appetite}`} aria-hidden="true">{APPETITE_LABEL[appetite][0]}</span>
+          <ProfileMenu place="side" kite={feeds.kite} onNavigate={close}>
+            <Avatar />
             <span className="sb-t">
-              <b>{APPETITE_LABEL[appetite]}</b>
-              <small>{profile.capital ? `${words(profile.capital)} capital` : 'Edit profile'}</small>
+              <b>{who}</b>
+              <small><i className={`dot ${appetite}`} aria-hidden="true" />{APPETITE_LABEL[appetite]}{profile.capital ? ` · ${words(profile.capital)}` : ''}</small>
             </span>
-            <ChevronRight size={16} className="sb-chev" aria-hidden="true" />
-          </button>
+          </ProfileMenu>
+          {!STATIC && (
+            <Link href="/profile?tab=zerodha" className={`sb-kite${feeds.kite === 'live' ? ' on' : ''}`} onClick={close}
+              title={feeds.kite === 'live' ? 'Zerodha connected: live market data (read only)' : 'Connect Zerodha for live market data'}>
+              <PlugZap size={16} strokeWidth={1.9} aria-hidden="true" />
+              <span className="sb-t">{feeds.kite === 'live' ? 'Zerodha connected' : feeds.kite == null ? 'Zerodha…' : 'Connect Zerodha'}</span>
+              <i className={`fd fd-${feeds.kite === 'live' ? 'live' : 'offline'}`} aria-hidden="true" />
+            </Link>
+          )}
           <dl className="sb-status sb-t" aria-label="Data sources">
             {status.map(([k, v]) => (
               <div key={k}>
@@ -147,15 +168,15 @@ export default function Shell({ children }: { children: ReactNode }) {
             <Menu size={24} strokeWidth={1.8} aria-hidden="true" />
           </button>
           <Link href="/dashboard" className="brand" aria-label="Hedge 360 dashboard"><BrandMark /><span className="brand-name">Hedge 360</span></Link>
-          <button type="button" className="profile-chip" onClick={editProfile} aria-label="Edit your trading profile">
-            <span className={`dot ${appetite}`} />
+          <ProfileMenu place="top" kite={feeds.kite}>
+            <Avatar size={28} />
             <span className="pc-text">{APPETITE_LABEL[appetite]}{profile.capital ? ` · ${words(profile.capital)}` : ''}</span>
-          </button>
+          </ProfileMenu>
         </div>
       </header>
 
       <div className="app-main" inert={open}>
-        {ready && profile.done ? children : <div className="loading">Loading your desk…</div>}
+        {signedIn && ready && profile.done ? children : <div className="loading">Loading your desk…</div>}
       </div>
       <Toast />
     </div>

@@ -8,9 +8,14 @@ import { useCallback, useEffect, useState } from 'react';
 import type { OptionRow, OptType } from './data';
 import { OPTIONS } from './data';
 
-export const DERIVS_API = process.env.NEXT_PUBLIC_DERIVS_API ?? 'http://localhost:8060/api/derivs';
+// Unset, the API is on port 8060 of whichever host name this page was opened on (localhost or 127.0.0.1), so the
+// sign-in cookie belongs to the same site as the page and the browser sends it.
+const HOST = typeof window === 'undefined' ? 'localhost' : window.location.hostname;
+export const DERIVS_API = process.env.NEXT_PUBLIC_DERIVS_API ?? `http://${HOST}:8060/api/derivs`;
 export const API_CMD = '.venv/bin/uvicorn server:app --port 8060';
-const STATIC = process.env.NEXT_PUBLIC_DERIVS_STATIC === '1';
+export const STATIC = process.env.NEXT_PUBLIC_DERIVS_STATIC === '1';
+/** Fired when the server answers 401: the sign-in ended, so lib/account.tsx checks the session again. */
+export const AUTH_LOST = 'hedge360-auth-lost';
 
 /** "/chain?symbol=M&M&expiry=30-Dec-2026" → "/chain/M_M/30-Dec-2026.json", the file export_static.py wrote for it. */
 function staticPath(path: string) {
@@ -63,6 +68,28 @@ export interface ChainResp extends Meta {
   /** Live data: "HH:MM" IST of the OI reading change in OI is measured from (before 09:15 means the previous close). */
   oiSince?: string | null;
 }
+/** Live only: the daily bars behind the 52-week range, filled on the day's first scan. */
+export interface HistoryState { state: 'idle' | 'filling' | 'ready' | 'error'; done: number; total: number; error: string | null }
+/** GET /screener[?rescan=1]: every stock's OTM options on its nearest expiry, as screener rows. Margin is estimated. */
+export interface ScreenerResp extends Meta {
+  /** ISO time (IST) of the scan the rows come from. */
+  scanned: string; otm: [number, number]; marginPct: number; history?: HistoryState; rows: OptionRow[];
+}
+export interface FnoStock {
+  symbol: string; sector: string; lot: number; lastExpiry: string;
+  /** NSE has stopped adding its contracts: no expiry after lastExpiry, when it leaves F&O. */
+  leaving: boolean;
+  /** ISO day it was first seen in the list; null in the sample. */
+  since: string | null;
+}
+/**
+ * GET /fno: today's F&O stocks from Kite's instrument list (stocks are EQ in segment NSE), the index underlyings,
+ * F&O names with neither an NSE stock nor an index row, and the joins and exits seen since trackedSince.
+ */
+export interface FnoResp extends Meta {
+  stocks: FnoStock[]; indices: string[]; unmatched: string[];
+  changes: Array<{ day: string; symbol: string; change: 'in' | 'out' }>; trackedSince: string | null;
+}
 /** GET /surface?symbol= : grids are [expiry][strike], null where an expiry has no such strike. */
 export interface SurfaceResp extends Meta {
   symbol: string; spot: number; lot: number; strikes: number[]; expiries: Array<{ expiry: string; dte: number }>;
@@ -79,9 +106,10 @@ export function useApi<T>(path: string | null): ApiState<T> {
     if (!path) return;
     const ctl = new AbortController();
     setS((x) => ({ data: x.data, error: null, loading: true }));
-    fetch(apiUrl(path), { signal: ctl.signal })
+    fetch(apiUrl(path), { signal: ctl.signal, credentials: 'include' })
       .then(async (r) => {
         if (STATIC && r.status === 404) throw new Error('No sample data for that symbol or expiry.');
+        if (r.status === 401) window.dispatchEvent(new Event(AUTH_LOST));
         if (!r.ok) throw new Error((await r.json().catch(() => null))?.detail ?? `The data server answered ${r.status}`);
         return r.json() as Promise<T>;
       })

@@ -1,9 +1,10 @@
 'use client';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Check, ChevronRight, CircleAlert, CircleCheck, ShieldCheck, X } from 'lucide-react';
 import Modal from './Modal';
 import type { OptionRow } from '@/lib/data';
+import { STATIC, apiUrl } from '@/lib/derivs';
 import { useStore } from '@/lib/store';
 import { APPETITE_LABEL, RULES, daysTo, expLabel, fmt, hedgeForOption, inr, optName, runChecks, type Appetite } from '@/lib/util';
 
@@ -22,6 +23,25 @@ export default function TradeCheck({ option, onClose }: { option: OptionRow; onC
     iv: String(option.iv), oi: option.oi == null ? '' : String(option.oi), margin: String(option.margin),
   }));
   const [appetite, setAppetite] = useState<Appetite>(profile.appetite ?? 'moderate');
+  // Screener rows carry an estimated margin. The margin endpoint has the broker's figure for this one contract (Kite's
+  // margin calculator, no order placed), so fetch it and use it unless the margin has been typed over meanwhile.
+  const [exact, setExact] = useState<'off' | 'loading' | 'got' | 'none'>('off');
+  useEffect(() => {
+    if (STATIC || option.src !== 'chain' || !option.est?.includes('margin')) return;
+    let dead = false;
+    setExact('loading');
+    const q = new URLSearchParams({ symbol: option.symbol, expiry: option.expiry, strike: String(option.strike), type: option.type });
+    fetch(apiUrl(`/margin?${q}`), { credentials: 'include' })
+      .then((r) => (r.ok ? (r.json() as Promise<{ margin: number | null }>) : Promise.reject()))
+      .then(({ margin: m }) => {
+        if (dead) return;
+        if (!m) { setExact('none'); return; }
+        setVals((v) => (v.margin === String(option.margin) ? { ...v, margin: String(Math.round(m)) } : v));
+        setExact('got');
+      })
+      .catch(() => { if (!dead) setExact('none'); });
+    return () => { dead = true; };
+  }, [option]);
 
   const num = (k: Editable, fallback: number) => { const v = parseFloat(vals[k]); return Number.isFinite(v) && v > 0 ? v : fallback; };
   const o = useMemo(() => {
@@ -39,7 +59,7 @@ export default function TradeCheck({ option, onClose }: { option: OptionRow; onC
   const dte = daysTo(option.expiry);
   const checks = runChecks(o, appetite, profile.capital);
   const hedge = hedgeForOption(o);
-  const est = (k: Editable) => option.est?.includes(k as never);
+  const est = (k: Editable) => !!option.est?.includes(k as never) && !(k === 'margin' && exact === 'got');
   const name = optName(o);
 
   const execute = (withHedge: boolean) => {
@@ -71,13 +91,14 @@ export default function TradeCheck({ option, onClose }: { option: OptionRow; onC
 
       <dl className="tc-stats">
         <div><dt>Credit</dt><dd className="up">{inr(o.totalPrem, 0)}</dd></div>
-        <div><dt>Prem % margin</dt><dd>{fmt(o.premPct)}%</dd>{dte > 0 && <small>≈ {fmt(o.premPct * (365 / dte), 0)}% a year</small>}</div>
+        <div><dt>Prem % margin</dt><dd>{fmt(o.premPct)}%</dd>{dte > 0 && <small>≈ {fmt(o.premPct * (365 / dte), 0)}% a year</small>}
+          {exact !== 'off' && <small className="tc-mg">{exact === 'loading' ? 'Getting Kite’s margin…' : exact === 'got' ? `Kite margin ${inr(o.margin, 0)}` : `Margin estimated (${inr(o.margin, 0)})`}</small>}</div>
         <div><dt>% OTM</dt><dd>{fmt(o.otm)}%</dd></div>
         <div><dt>Breakeven</dt><dd>{inr(o.be)}</dd><small>{fmt(o.beDist, 1)}% {option.type === 'PE' ? 'below' : 'above'} CMP</small></div>
       </dl>
 
       <details className="tc-edit">
-        <summary><ChevronRight size={16} aria-hidden="true" /> Update prices from your option chain{option.est && <span className="tag tag-est">some values estimated</span>}</summary>
+        <summary><ChevronRight size={16} aria-hidden="true" /> Update prices from your option chain{FIELDS.some((f) => est(f.k)) && <span className="tag tag-est">some values estimated</span>}</summary>
         <div className="inputs">
           {FIELDS.map((f) => (
             <div className="field" key={f.k}>

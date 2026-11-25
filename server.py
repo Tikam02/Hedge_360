@@ -11,19 +11,28 @@ from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from derivs import router as derivs_router
+from accounts import auth_router, journal_router, me_router, notes_router, tickers_router
+from kite_auth import callback_router as kite_callback_router
+from kite_auth import router as kite_router
 from kite_client import KiteError
 from scanner import Scan, load_last, market_open
 
 STATIC = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="Put screener")
-# The Next.js app (web/, port 3000) reads /api/derivs from the browser.
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], allow_methods=["GET"])
+# The Next.js app (web/, port 3000) signs in (/api/auth), reads /api/derivs and drives the Zerodha login (/api/kite)
+# from the browser, with the session cookie. Only that origin may: other sites can't read anything back or send JSON.
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], allow_credentials=True,
+                   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"], allow_headers=["Content-Type"])
+# Answer only requests addressed to this machine, so a web page can't reach the login API by rebinding its own
+# domain to 127.0.0.1 (CORS alone doesn't stop that).
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 state = {"scan": load_last()}
 
 
@@ -87,6 +96,7 @@ def scan_csv(traded: bool = False):
 
 
 # Registered before the static mount, which would otherwise answer every path.
-app.include_router(derivs_router)
+for r in (auth_router, me_router, notes_router, journal_router, tickers_router, derivs_router, kite_router, kite_callback_router):
+    app.include_router(r)
 
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

@@ -1,10 +1,14 @@
 """
-Kite Connect as the option chain source. Start the API with it:
+Kite Connect as the option chain source. derivs.py uses it while a Zerodha session is live (log in on the web app's
+Profile page, see kite_auth.py), or always when the API is started with it:
 
     DERIVS_CHAIN_SOURCE=kite_chain .venv/bin/uvicorn server:app --port 8060
 
 Read only: the instrument list, market quotes and the margin calculator, through kite_client, which refuses every
-other call. Nothing here can place an order. With this chain source, Sectoral analysis comes from Kite too
+other call. Instruments are told apart only by the list's own columns: futures are instrument_type FUT in segment
+NFO-FUT, options CE / PE in NFO-OPT (BFO the same), stocks EQ in segment NSE, indices segment INDICES. The day's rows
+are kept in PostgreSQL (kite_instruments), so a restart reads them back instead of asking Kite again, and the F&O
+stock list is recorded each day (fno_stocks, fno_changes): fno_list() says which stocks joined, left or are leaving. Nothing here can place an order. With this chain source, Sectoral analysis comes from Kite too
 (kite_sectors.py, named by SECTOR_SOURCE below).
 
 Gives the three functions derivs.py reads from any chain source (underlyings, expiries, chain, in derivs_sample's
@@ -26,15 +30,15 @@ import json
 import logging
 import math
 import os
-import re
 import threading
 import time
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 
-import pandas as pd
+from fastapi import HTTPException
 
+import db
 import derivs_sample
 import kite_client
 from scanner import IST
@@ -42,14 +46,17 @@ from scanner import IST
 log = logging.getLogger("kite_chain")
 
 CACHE = Path(os.environ.get("KITE_CACHE_DIR") or Path(__file__).resolve().parent / ".kite_cache")
-EXCHANGES = ("NFO", "BFO")
+EXCHANGES = ("NFO", "BFO")       # where the contracts are
+SPOT_EXCHANGES = ("NSE", "BSE")  # where the underlyings are: stocks (EQ in segment NSE) and indices (segment INDICES)
 BFO_NAMES = {"SENSEX", "BANKEX"}  # BSE stock options are thin; only its index options are listed
-# Index spot quotes. Stocks use "NSE:<symbol>".
-SPOT_KEYS = {
-    "NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK", "FINNIFTY": "NSE:NIFTY FIN SERVICE",
-    "MIDCPNIFTY": "NSE:NIFTY MID SELECT", "NIFTYNXT50": "NSE:NIFTY NEXT 50", "SENSEX": "BSE:SENSEX", "BANKEX": "BSE:BANKEX",
+# An index's contracts are named NIFTY, its spot row "NIFTY 50", and Kite's list has no column linking the two, so
+# this map does. Whether the row is there, in segment INDICES, is checked against the day's list.
+INDEX_OF = {
+    "NIFTY": ("NSE", "NIFTY 50"), "BANKNIFTY": ("NSE", "NIFTY BANK"), "FINNIFTY": ("NSE", "NIFTY FIN SERVICE"),
+    "MIDCPNIFTY": ("NSE", "NIFTY MID SELECT"), "NIFTYNXT50": ("NSE", "NIFTY NEXT 50"), "NIFTYFPI": ("NSE", "NIFTY FPI 150"),
+    "SENSEX": ("BSE", "SENSEX"), "BANKEX": ("BSE", "BANKEX"),
 }
-INDEX_ORDER = list(SPOT_KEYS)
+INDEX_ORDER = list(INDEX_OF)
 SECTOR = {symbol: sector for symbol, sector, *_ in derivs_sample.DEFS}
 STRIKES_EACH_SIDE = 20
 RATE = 0.065
@@ -58,9 +65,9 @@ MARGIN_CHUNK = 20
 SECTOR_SOURCE = "kite_sectors"  # derivs.py reads Sectoral analysis from this module when the chain is Kite
 
 _lock = threading.RLock()
-_state = {"day": None, "book": None, "client": None, "creds": None, "spots": (0, None), "base": None}
+_state = {"day": None, "book": None, "client": None, "creds": None, "spots": (0, None), "base": None, "tokens": {}}
 _quotes = {}   # key -> (fetched_at, quote)
-_margins = {}  # (symbol, expiry) -> (fetched_at, {(strike, kind): total})
+_margins = {}  # contract key -> (fetched_at, ₹ total or None)
 
 
 def _today():
@@ -79,46 +86,68 @@ def status():
     return "live" if kite_client.connected() else "offline"
 
 
-# ── Instruments (once a day, cached on disk) ───────────
-def _name_of(row):
-    """Kite's sample dump leaves `name` blank on some F&O rows; then read it off the tradingsymbol."""
-    if row["name"]:
-        return row["name"]
-    m = re.match(r"^(.*?)\d{2}(?:[A-Z]{3}|[1-9OND]\d{2})", row["tradingsymbol"])
-    return m.group(1) if m else row["tradingsymbol"]
+# ── Instruments (once a day, kept in PostgreSQL) ───────
+COLUMNS = ("exchange", "tradingsymbol", "instrument_token", "exchange_token", "name", "last_price", "expiry", "strike",
+           "tick_size", "lot_size", "instrument_type", "segment")
+
+
+def _wanted(df, exchange):
+    """The rows of one exchange's instrument list this app uses, by Kite's own columns: futures (instrument_type FUT in
+    segment <EX>-FUT) and options (CE or PE in <EX>-OPT) on NFO and BFO; stocks (EQ in segment NSE) and indices
+    (segment INDICES) on NSE, indices only on BSE."""
+    kind, seg = df["instrument_type"], df["segment"]
+    if exchange in EXCHANGES:
+        fut = (seg == f"{exchange}-FUT") & (kind == "FUT")
+        opt = (seg == f"{exchange}-OPT") & kind.isin(["CE", "PE"])
+        return df[(fut | opt) & (df["name"] != "") & (df["expiry"] != "")]
+    return df[(seg == "INDICES") | ((seg == "NSE") & (kind == "EQ"))] if exchange == "NSE" else df[seg == "INDICES"]
 
 
 def _load(exchange, today):
-    f = CACHE / f"instruments-{exchange}-{today}.csv"
-    if f.exists():
-        return pd.read_csv(f, dtype={"tradingsymbol": str, "name": str, "expiry": str}, keep_default_na=False)
-    df = _api().instruments(exchange)
-    CACHE.mkdir(exist_ok=True)
-    for old in CACHE.glob(f"instruments-{exchange}-*.csv"):
-        old.unlink()
-    df.to_csv(f, index=False)
-    return df
+    """Today's rows of one exchange (_wanted): from kite_instruments, or the day's first time from Kite, then stored
+    there (replacing yesterday's). Without the database they come straight from Kite."""
+    try:
+        with db.conn() as c:
+            rows = c.execute(f"SELECT {', '.join(COLUMNS)} FROM kite_instruments WHERE exchange = %s AND day = %s",
+                             (exchange, today)).fetchall()
+        if rows:
+            return rows
+    except HTTPException:
+        return _wanted(_api().instruments(exchange), exchange).to_dict("records")
+    rows = _wanted(_api().instruments(exchange), exchange).to_dict("records")
+    num = lambda v, f=float: f(float(v)) if str(v).strip() else None  # noqa: E731
+    try:
+        with db.conn() as c:
+            c.execute("DELETE FROM kite_instruments WHERE exchange = %s", (exchange,))
+            with c.cursor().copy(f"COPY kite_instruments ({', '.join(COLUMNS)}, day) FROM STDIN") as cp:
+                for r in rows:
+                    cp.write_row((exchange, r["tradingsymbol"], num(r["instrument_token"], int), num(r["exchange_token"], int),
+                                  r["name"], num(r["last_price"]), date.fromisoformat(str(r["expiry"])[:10]) if r["expiry"] else None,
+                                  num(r["strike"]) or 0, num(r["tick_size"]) or 0, num(r["lot_size"], int) or 0,
+                                  r["instrument_type"], r["segment"], today))
+    except HTTPException:
+        pass  # the database went down meanwhile: today's rows are in memory, the next restart asks Kite again
+    return rows
 
 
 def _book():
-    """{symbol: {lot, step, exp: {date: {strike: {"CE": inst, "PE": inst}}}, fut: {date: inst}}}, live expiries only."""
+    """{symbol: {kind, spot, lot, step, exp: {date: {strike: {"CE": inst, "PE": inst}}}, fut: {date: inst}}}, live
+    expiries only. kind is "stock" when NSE lists the name as EQ in segment NSE, "index" when its INDEX_OF row is in
+    segment INDICES; spot is that row's {key, token}. Names with neither are left out (_state["unmatched"])."""
     today = _today()
     with _lock:
         if _state["day"] == today:
             return _state["book"]
         book = {}
         for exchange in EXCHANGES:
-            for row in _load(exchange, today).to_dict("records"):
-                kind = row["instrument_type"]
-                if kind not in ("CE", "PE", "FUT") or not row["expiry"]:
-                    continue
-                name = _name_of(row)
+            for row in _load(exchange, today):
+                kind, name = row["instrument_type"], row["name"]
                 if exchange == "BFO" and name not in BFO_NAMES:
                     continue
                 expiry = date.fromisoformat(str(row["expiry"])[:10])
                 if expiry < today:
                     continue
-                inst = {"key": f"{exchange}:{row['tradingsymbol']}", "exchange": exchange,
+                inst = {"key": f"{exchange}:{row['tradingsymbol']}", "exchange": exchange, "token": int(row["instrument_token"]),
                         "tradingsymbol": row["tradingsymbol"], "lot": int(float(row["lot_size"]))}
                 b = book.setdefault(name, {"exp": {}, "fut": {}})
                 if kind == "FUT":
@@ -127,14 +156,83 @@ def _book():
                     b["exp"].setdefault(expiry, {}).setdefault(float(row["strike"]), {})[kind] = inst
         for name in [n for n, b in book.items() if not b["exp"]]:
             del book[name]
+        spot_rows = [r for exchange in SPOT_EXCHANGES for r in _load(exchange, today)]
+        stocks = {r["tradingsymbol"]: r for r in spot_rows if r["segment"] == "NSE" and r["instrument_type"] == "EQ"}
+        indices = {(r["exchange"], r["tradingsymbol"]): r for r in spot_rows if r["segment"] == "INDICES"}
+        unmatched = []
+        for name, b in list(book.items()):
+            row = indices.get(INDEX_OF[name]) if name in INDEX_OF else stocks.get(name)
+            if not row:
+                unmatched.append(name)
+                del book[name]
+                continue
+            b["kind"] = "index" if name in INDEX_OF else "stock"
+            b["spot"] = {"key": f"{row['exchange']}:{row['tradingsymbol']}", "token": int(row["instrument_token"])}
+        if unmatched:
+            log.warning("no NSE stock (EQ) or index (INDICES) row for %s; left out", ", ".join(sorted(unmatched)))
         for b in book.values():
             near = b["exp"][min(b["exp"])]
             b["lot"] = next(iter(next(iter(near.values())).values()))["lot"]
             ks = sorted(near)
             gaps = Counter(round(hi - lo, 2) for lo, hi in zip(ks, ks[1:]))
             b["step"] = gaps.most_common(1)[0][0] if gaps else 1
-        _state.update(day=today, book=book, base=None)
+        tokens = {i["key"]: i["token"] for b in book.values() for i in
+                  [*b["fut"].values(), *(i for by in b["exp"].values() for sides in by.values() for i in sides.values())]}
+        _state.update(day=today, book=book, base=None, tokens=tokens, unmatched=sorted(unmatched))
+        _track(book, today)
         return book
+
+
+# ── Which stocks are in F&O ────────────────────────────
+def _last_expiry(b):
+    return max([*b["exp"], *b["fut"]])
+
+
+def _track(book, today):
+    """Record the day's F&O stocks (fno_stocks) and which joined or left since the last day seen (fno_changes). The
+    first day only sets the list; running again the same day changes nothing."""
+    stocks = {n: b for n, b in book.items() if b["kind"] == "stock"}
+    try:
+        with db.conn() as c:
+            prev = c.execute("SELECT max(last_seen) AS d FROM fno_stocks").fetchone()["d"]
+            was = {r["symbol"] for r in c.execute("SELECT symbol FROM fno_stocks WHERE last_seen = %s", (prev,))} if prev else set()
+            with c.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO fno_stocks (symbol, token, lot, first_seen, last_seen, last_expiry) VALUES (%s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (symbol) DO UPDATE SET token = EXCLUDED.token, lot = EXCLUDED.lot,
+                       last_seen = EXCLUDED.last_seen, last_expiry = EXCLUDED.last_expiry""",
+                    [(n, b["spot"]["token"], b["lot"], today, today, _last_expiry(b)) for n, b in stocks.items()])
+                if prev and prev < today:
+                    cur.executemany("INSERT INTO fno_changes (day, symbol, change) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                                    [(today, n, "in") for n in sorted(set(stocks) - was)]
+                                    + [(today, n, "out") for n in sorted(was - set(stocks))])
+    except HTTPException:
+        log.warning("database down: today's F&O list isn't recorded")
+
+
+def fno_list():
+    """The F&O stocks in today's instrument list, and the changes seen. A stock is leaving when NSE has stopped adding
+    its contracts: its last expiry is before the one most stocks have, and it is out after that day."""
+    book = _book()
+    stocks = {n: b for n, b in book.items() if b["kind"] == "stock"}
+    last = {n: _last_expiry(b) for n, b in stocks.items()}
+    common = Counter(last.values()).most_common(1)[0][0] if last else None
+    try:
+        with db.conn() as c:
+            first = {r["symbol"]: r["first_seen"] for r in c.execute("SELECT symbol, first_seen FROM fno_stocks")}
+            since = min(first.values(), default=None)
+            changes = [{"day": r["day"].isoformat(), "symbol": r["symbol"], "change": r["change"]} for r in
+                       c.execute("SELECT day, symbol, change FROM fno_changes ORDER BY day DESC, change, symbol LIMIT 500")]
+    except HTTPException:
+        first, since, changes = {}, None, []
+    return {
+        "stocks": [{"symbol": n, "lot": b["lot"], "lastExpiry": _label(last[n]),
+                    "leaving": last[n] < common, "since": first[n].isoformat() if n in first else None}
+                   for n, b in sorted(stocks.items())],
+        "indices": [n for n in INDEX_ORDER if n in book],
+        "unmatched": _state.get("unmatched") or [],
+        "changes": changes, "trackedSince": since.isoformat() if since else None,
+    }
 
 
 def _label(d):
@@ -147,12 +245,20 @@ def _expiry_date(label):
 
 # ── Quotes ─────────────────────────────────────────────
 def _quote(keys):
-    """Full quotes, reusing any fetched in the last few seconds. Keys Kite has no data for are left out."""
+    """Full quotes, reusing any fetched in the last few seconds. Keys Kite has no data for are left out.
+    Asked for by the day's instrument tokens: Kite answers the same quote for a token as for "NFO:<tradingsymbol>",
+    and a token is under half as long, so a call carries 500 instruments instead of about 200 (they go in the URL)."""
+    _book()
     now = time.monotonic()
     with _lock:
         missing = [k for k in dict.fromkeys(keys) if k not in _quotes or now - _quotes[k][0] > QUOTE_TTL]
+        token = _state["tokens"]
     if missing:
-        got = _api().quote(missing)
+        by_token = {str(token[k]): k for k in missing if k in token}
+        got = {by_token[t]: v for t, v in _api().quote(list(by_token)).items() if t in by_token} if by_token else {}
+        rest = [k for k in missing if k not in token]
+        if rest:
+            got.update(_api().quote(rest))
         with _lock:
             for k in missing:  # "no data" is cached too, so it isn't asked for again on every call
                 _quotes[k] = (now, got.get(k))
@@ -166,7 +272,7 @@ def _spots():
         if spots is not None and time.monotonic() - at < SPOT_TTL:
             return spots
     book = _book()
-    keys = {name: SPOT_KEYS.get(name, f"NSE:{name}") for name in book}
+    keys = {name: b["spot"]["key"] for name, b in book.items()}
     got = _api().ohlc(sorted(set(keys.values())))
     spots = {name: got[k] for name, k in keys.items() if k in got and got[k].get("last_price")}
     with _lock:
@@ -177,12 +283,12 @@ def _spots():
 # ── The source interface derivs.py reads ───────────────
 def underlyings():
     book, spots = _book(), _spots()
-    order = lambda n: (INDEX_ORDER.index(n) if n in SPOT_KEYS else len(INDEX_ORDER), n)  # noqa: E731
+    order = lambda n: (INDEX_ORDER.index(n) if book[n]["kind"] == "index" else len(INDEX_ORDER), n)  # noqa: E731
     out = []
     for name in sorted(spots, key=order):
         q, b = spots[name], book[name]
         last, close = q["last_price"], (q.get("ohlc") or {}).get("close") or 0
-        index = name in SPOT_KEYS
+        index = b["kind"] == "index"
         out.append({"symbol": name, "sector": "Index" if index else SECTOR.get(name, "Other"), "index": index,
                     "spot": last, "chg": (last - close) / close * 100 if close else 0.0, "lot": b["lot"], "step": b["step"]})
     return out
@@ -327,29 +433,25 @@ def build(expiry, spot, contracts, fut, q):
     return {"spot": spot, "fut": F, "dte": dte, "rows": rows, "oi_since": since}
 
 
-def margins(symbol, expiry_label, strikes):
+def margins(symbol, expiry_label, strikes, kinds=("CE", "PE")):
     """{(strike, "CE"|"PE"): ₹} to sell one lot of each, NRML, each on its own (consider_positions=false).
-    A margin calculation through Kite's basket calculator; no order is placed."""
-    ck = (symbol, expiry_label)
-    with _lock:
-        hit = _margins.get(ck)
-        if hit and time.monotonic() - hit[0] < MARGIN_TTL:
-            return hit[1]
+    A margin calculation through Kite's basket calculator; no order is placed. Kept per contract for MARGIN_TTL, so
+    the chain page and the Screener's trade check share what either fetched."""
     by_strike = _book()[symbol]["exp"][_expiry_date(expiry_label)]
     want = {float(k) for k in strikes}
-    insts = [(k, kind, sides[kind]) for k, sides in by_strike.items() if k in want for kind in ("CE", "PE") if kind in sides]
+    insts = [(k, kind, sides[kind]) for k, sides in by_strike.items() if k in want for kind in kinds if kind in sides]
+    now = time.monotonic()
+    with _lock:
+        todo = [i for _, _, i in insts if not (i["key"] in _margins and now - _margins[i["key"]][0] < MARGIN_TTL)]
     orders = [{"exchange": i["exchange"], "tradingsymbol": i["tradingsymbol"], "transaction_type": "SELL",
                "variety": "regular", "product": "NRML", "order_type": "MARKET", "quantity": i["lot"],
-               "price": 0, "trigger_price": 0} for _, _, i in insts]
+               "price": 0, "trigger_price": 0} for i in todo]
     totals = {}
     for n in range(0, len(orders), MARGIN_CHUNK):
         data = _api().basket_margins(orders[n:n + MARGIN_CHUNK], consider_positions=False)
         totals.update({(o["exchange"], o["tradingsymbol"]): o.get("total") for o in data.get("orders") or []})
-    out = {}
-    for k, kind, i in insts:
-        total = totals.get((i["exchange"], i["tradingsymbol"]))
-        if total:
-            out[(int(k) if k.is_integer() else k, kind)] = total
     with _lock:
-        _margins[ck] = (time.monotonic(), out)
-    return out
+        for i in todo:
+            _margins[i["key"]] = (now, totals.get((i["exchange"], i["tradingsymbol"])))
+        return {(int(k) if k.is_integer() else k, kind): _margins[i["key"]][1]
+                for k, kind, i in insts if i["key"] in _margins and _margins[i["key"]][1]}

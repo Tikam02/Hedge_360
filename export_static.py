@@ -4,17 +4,19 @@ Writes the analytics API's answers as JSON files for the GitHub Pages build of t
     python export_static.py web/public/derivs
 
 One file per request the web app makes: health.json, sectors.json, symbols.json, chain/<SYMBOL>.json (nearest
-expiry), chain/<SYMBOL>/<EXPIRY>.json and surface/<SYMBOL>.json. web/lib/derivs.ts asks for these files instead of
-the API when NEXT_PUBLIC_DERIVS_STATIC is set; both sides turn anything but letters, digits and "-" in a name into
-"_" (M&M is chain/M_M.json).
+expiry), chain/<SYMBOL>/<EXPIRY>.json, surface/<SYMBOL>.json, screener.json and fno.json. web/lib/derivs.ts asks
+for these files instead of the API when NEXT_PUBLIC_DERIVS_STATIC is set; both sides turn anything but letters,
+digits and "-" in a name into "_" (M&M is chain/M_M.json).
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-import derivs
+os.environ["DERIVS_CHAIN_SOURCE"] = "derivs_sample"  # the public site shows sample data even if you're logged in to Zerodha
+import derivs  # noqa: E402
 
 
 def safe(name):
@@ -31,6 +33,8 @@ def main(out):
 
     put("health.json", derivs.health())
     put("sectors.json", derivs.sectors())
+    put("screener.json", derivs.screener())
+    put("fno.json", derivs.fno())
     syms = derivs.symbols()
     put("symbols.json", syms)
     for s in syms["symbols"]:
